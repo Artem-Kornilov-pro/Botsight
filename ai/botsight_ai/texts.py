@@ -29,6 +29,10 @@ log = logging.getLogger(__name__)
 
 SAMPLE_EVERY = 10  # above the daily limit one text in SAMPLE_EVERY is kept
 
+# Projects with texts not yet clustered. Marked on arrival, not by event time: events
+# may come late (SDK buffering, retries, skewed clocks) and must still trigger topics.
+DIRTY_PROJECTS = "ai:topics:dirty"
+
 
 @dataclass(frozen=True)
 class TextRecord:
@@ -111,6 +115,7 @@ class TextIngestor:
         self.ch.insert(
             "message_points", rows, column_names=["project_id", "event_id", "ts", "point_id"]
         )
+        self.rdb.sadd(DIRTY_PROJECTS, *{r[0] for r in rows})
 
     def _apply_daily_limit(self, records: list[TextRecord]) -> list[TextRecord]:
         """Per-project daily limit of texts (Botsight.md, 14.1, item 8): above it a stable

@@ -23,6 +23,7 @@ from .alerts import Alert, AlertSink
 from .config import Config
 from .llm import LLM, LLMError, parse_json_object
 from .storage import VectorStore
+from .texts import DIRTY_PROJECTS
 
 log = logging.getLogger(__name__)
 
@@ -356,32 +357,29 @@ class TopicRunner:
 
 
 class TopicScheduler:
-    """Runs projects with new texts once per interval. A Redis lock per project lets
-    several ai-worker instances share the work without running a project twice."""
+    """Runs projects with new texts at most once per interval. New texts mark their project
+    in a Redis set when they arrive (texts.DIRTY_PROJECTS); a lock per project lets several
+    ai-worker instances share the work without running a project twice."""
 
-    def __init__(self, runner: TopicRunner, ch: Client, rdb: redis.Redis, interval: float) -> None:
+    def __init__(self, runner: TopicRunner, rdb: redis.Redis, interval: float) -> None:
         self.runner = runner
-        self.ch = ch
         self.rdb = rdb
         self.interval = interval
 
     def due_projects(self) -> list[int]:
-        rows = self.ch.query(
-            "SELECT DISTINCT project_id FROM message_points "
-            "WHERE ts >= now64(3) - toIntervalSecond({s:UInt32})",
-            parameters={"s": int(self.interval)},
-        ).result_rows
-        return [int(r[0]) for r in rows]
+        return sorted(int(p) for p in self.rdb.smembers(DIRTY_PROJECTS))
 
     def tick(self) -> int:
         done = 0
         for project_id in self.due_projects():
             if self.rdb.exists(f"ai:topics:done:{project_id}"):
-                continue
+                continue  # ran recently: stays marked and runs after the interval
             lock = self.rdb.lock(f"ai:topics:lock:{project_id}", timeout=1800, blocking=False)
             if not lock.acquire():
                 continue
             try:
+                # unmark first: texts arriving during the run mark the project again
+                self.rdb.srem(DIRTY_PROJECTS, project_id)
                 result = self.runner.run(project_id)
                 self.rdb.set(f"ai:topics:done:{project_id}", result.status, ex=int(self.interval))
                 done += 1
@@ -393,6 +391,7 @@ class TopicScheduler:
                     len(result.alerts),
                 )
             except Exception:
+                self.rdb.sadd(DIRTY_PROJECTS, project_id)  # retried on the next tick
                 log.exception("topics: project %d failed", project_id)
             finally:
                 lock.release()

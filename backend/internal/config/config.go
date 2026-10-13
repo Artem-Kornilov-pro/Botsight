@@ -253,3 +253,57 @@ func (p *parser) duration(key string, def time.Duration) time.Duration {
 	}
 	return d
 }
+
+// Antifraud is the configuration of the antifraud service (Botsight.md, 15).
+type Antifraud struct {
+	Addr               string        // ANTIFRAUD_ADDR: /healthz, /readyz, /metrics; default :8083
+	RedisURL           string        // REDIS_URL: one scoring run per minute across instances
+	KafkaBrokers       string        // KAFKA_BROKERS
+	KafkaReplication   int16         // KAFKA_REPLICATION_FACTOR
+	CreateTopics       bool          // KAFKA_CREATE_TOPICS
+	Group              string        // ANTIFRAUD_GROUP, default antifraud
+	ClickHouseAddr     string        // CLICKHOUSE_ADDR host:9000
+	ClickHouseDatabase string        // CLICKHOUSE_DATABASE, default botsight
+	ClickHouseUser     string        // CLICKHOUSE_USER, default default
+	ClickHousePassword string        // CLICKHOUSE_PASSWORD
+	Replay             time.Duration // ANTIFRAUD_REPLAY: window re-read on partition assignment, default 24h
+	FlushInterval      time.Duration // ANTIFRAUD_FLUSH_INTERVAL: user_features writes, default 10s
+	MaxUsers           int           // ANTIFRAUD_MAX_USERS per instance, default 5 000 000
+	RunInterval        time.Duration // ANTIFRAUD_RUN_INTERVAL: scoring, default 1m
+	GraphEvery         int           // ANTIFRAUD_GRAPH_EVERY: rebuild the referral graph on every n-th run, default 5
+	LogLevel           string
+}
+
+func LoadAntifraud() (Antifraud, error) {
+	c := Antifraud{
+		Addr:               env("ANTIFRAUD_ADDR", ":8083"),
+		RedisURL:           os.Getenv("REDIS_URL"),
+		KafkaBrokers:       os.Getenv("KAFKA_BROKERS"),
+		Group:              env("ANTIFRAUD_GROUP", "antifraud"),
+		ClickHouseAddr:     os.Getenv("CLICKHOUSE_ADDR"),
+		ClickHouseDatabase: env("CLICKHOUSE_DATABASE", "botsight"),
+		ClickHouseUser:     env("CLICKHOUSE_USER", "default"),
+		ClickHousePassword: os.Getenv("CLICKHOUSE_PASSWORD"),
+		LogLevel:           env("LOG_LEVEL", "info"),
+	}
+	p := parser{}
+	c.KafkaReplication = int16(p.int("KAFKA_REPLICATION_FACTOR", 1))
+	c.CreateTopics = p.bool("KAFKA_CREATE_TOPICS", true)
+	c.Replay = p.duration("ANTIFRAUD_REPLAY", 24*time.Hour)
+	c.FlushInterval = p.duration("ANTIFRAUD_FLUSH_INTERVAL", 10*time.Second)
+	c.MaxUsers = p.int("ANTIFRAUD_MAX_USERS", 5_000_000)
+	c.RunInterval = p.duration("ANTIFRAUD_RUN_INTERVAL", time.Minute)
+	c.GraphEvery = p.int("ANTIFRAUD_GRAPH_EVERY", 5)
+	if p.err != nil {
+		return c, p.err
+	}
+	switch {
+	case c.RedisURL == "":
+		return c, fmt.Errorf("config: REDIS_URL is required")
+	case c.KafkaBrokers == "":
+		return c, fmt.Errorf("config: KAFKA_BROKERS is required")
+	case c.ClickHouseAddr == "":
+		return c, fmt.Errorf("config: CLICKHOUSE_ADDR is required")
+	}
+	return c, nil
+}

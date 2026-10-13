@@ -5,6 +5,7 @@
 #   Mailpit     http://localhost:8025  (emails sent by the api)
 #   ClickHouse  http://localhost:8123  (user and password: botsight)
 #   Kafka       localhost:9094
+#   antifraud   http://localhost:8083  (/readyz, /metrics)
 #   ai-worker   http://localhost:8090  (/readyz, /metrics; /internal/ask is called by the api)
 #   Qdrant      http://localhost:6333  (message vectors)
 # Data path: SDK -> collector -> Kafka -> ch-writer -> ClickHouse (Botsight.md, 7.3).
@@ -179,6 +180,30 @@ services:
       LOG_LEVEL: info
     ports:
       - "127.0.0.1:8082:8082"
+    depends_on:
+      migrate-clickhouse:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  antifraud:
+    build:
+      context: ../backend
+      args:
+        SERVICE: antifraud
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+      CLICKHOUSE_ADDR: clickhouse:9000
+      CLICKHOUSE_USER: botsight
+      CLICKHOUSE_PASSWORD: botsight
+      ANTIFRAUD_RUN_INTERVAL: ${ANTIFRAUD_RUN_INTERVAL:-1m}
+      ANTIFRAUD_GRAPH_EVERY: ${ANTIFRAUD_GRAPH_EVERY:-1} # small local data: the graph on every run
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8083:8083"
     depends_on:
       migrate-clickhouse:
         condition: service_completed_successfully

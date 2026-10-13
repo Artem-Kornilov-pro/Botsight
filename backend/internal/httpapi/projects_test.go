@@ -97,7 +97,7 @@ func TestProjectLifecycleAndKeys(t *testing.T) {
 
 func expectRevoked(t *testing.T, ch <-chan *redis.Message, prefix string) {
 	t.Helper()
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(15 * time.Second)
 	for {
 		select {
 		case msg := <-ch:

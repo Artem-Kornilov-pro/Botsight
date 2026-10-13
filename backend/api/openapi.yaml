@@ -27,6 +27,7 @@ tags:
   - name: funnels
   - name: ad-spend
   - name: ai
+  - name: antifraud
   - name: health
 
 paths:
@@ -681,6 +682,44 @@ paths:
         "502": { description: "`llm_error` or `ai_unavailable`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { description: "`llm_disabled` or `ai_unavailable`: no LLM or ai-worker configured", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
+  /v1/projects/{projectID}/antifraud:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [antifraud]
+      summary: Share of suspicious users per traffic source, last 24 hours (any member)
+      description: Results of the latest scoring run of the antifraud service (Botsight.md, 15), updated every minute.
+      responses:
+        "200":
+          description: Sources, the most suspicious first; updated_at is null before the first run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AntifraudSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { description: "`analytics_unavailable`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/projects/{projectID}/antifraud/users:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [antifraud]
+      summary: Suspicious users of the latest run (any member)
+      parameters:
+        - { name: source, in: query, schema: { type: string }, description: "Only this source; empty string means users without a label" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000, default: 100 } }
+      responses:
+        "200":
+          description: Users, the highest score first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users]
+                properties:
+                  users: { type: array, items: { $ref: "#/components/schemas/SuspiciousUser" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { description: "`analytics_unavailable`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
 security:
   - session: []
 
@@ -918,7 +957,7 @@ components:
       required: [id, kind, created_at, title, text, details]
       properties:
         id: { type: string, format: uuid }
-        kind: { type: string, enum: [topic_trend, anomaly] }
+        kind: { type: string, enum: [topic_trend, anomaly, fraud] }
         created_at: { type: string, format: date-time }
         title: { type: string }
         text: { type: string }
@@ -935,3 +974,45 @@ components:
         columns: { type: array, items: { type: string } }
         rows: { type: array, items: { type: array, items: {} } }
         truncated: { type: boolean, description: More than 1000 rows }
+
+    AntifraudReasons:
+      type: object
+      description: Suspicious users per reason
+      additionalProperties: { type: integer }
+      example: { fast_steps: 38, synced_timing: 37 }
+
+    AntifraudSummary:
+      type: object
+      required: [updated_at, window_hours, threshold, users, suspicious, sources, reason_texts]
+      properties:
+        updated_at: { type: [string, "null"], format: date-time }
+        window_hours: { type: integer }
+        threshold: { type: number, description: A user is suspicious from this score }
+        users: { type: integer }
+        suspicious: { type: integer }
+        sources:
+          type: array
+          items:
+            type: object
+            required: [source, users, suspicious, share, avg_score, reasons]
+            properties:
+              source: { type: string, description: "Deep link label; empty for users without one" }
+              users: { type: integer }
+              suspicious: { type: integer }
+              share: { type: number }
+              avg_score: { type: number }
+              reasons: { $ref: "#/components/schemas/AntifraudReasons" }
+        reason_texts:
+          type: object
+          additionalProperties: { type: string }
+          description: "Reason codes: fast_steps, synced_timing, referral_ring, homogeneous_source, fresh_accounts, start_spike"
+
+    SuspiciousUser:
+      type: object
+      required: [user_id, source, joined, score, reasons]
+      properties:
+        user_id: { type: string, description: A string because pseudonymized ids exceed 2^53 }
+        source: { type: string }
+        joined: { type: string, format: date-time }
+        score: { type: number, minimum: 0, maximum: 1 }
+        reasons: { type: array, items: { type: string } }

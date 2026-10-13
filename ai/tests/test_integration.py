@@ -6,6 +6,7 @@ import json
 import random
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from conftest import EVENT_COLUMNS, FakeLLM, event_row, new_uuid, ts
@@ -16,8 +17,8 @@ from botsight_ai.config import Config
 from botsight_ai.llm import DisabledLLM
 from botsight_ai.nlsql import Asker, NLSQLError
 from botsight_ai.storage import VectorStore, clickhouse
-from botsight_ai.texts import TextIngestor, TextRecord
-from botsight_ai.topics import TopicRunner
+from botsight_ai.texts import DIRTY_PROJECTS, TextIngestor, TextRecord
+from botsight_ai.topics import TopicRunner, TopicScheduler
 
 pytestmark = pytest.mark.integration
 
@@ -192,6 +193,42 @@ def test_too_few_texts(
     store_texts(ch, ingestor, project_id, [("привет", NOW)])
     run, _ = runner(cfg, vectors)
     assert run.run(project_id, ts(NOW)).status == "too_few"
+
+
+def test_scheduler_runs_projects_with_new_texts(
+    cfg: Config, ch: Any, rdb: Any, embedder: Any, vectors: VectorStore, project_id: int
+) -> None:
+    rdb.delete(DIRTY_PROJECTS)  # other tests' projects
+    ingestor = TextIngestor(embedder, vectors, ch, rdb, daily_limit=100_000)
+    # events from hours ago (late delivery, simulated clocks) still make the project due
+    old = NOW - timedelta(hours=3)
+    first = texts_of("code", 40, 4) + texts_of("pay", 40, 5)
+    store_texts(ch, ingestor, project_id, [(t, old) for t in first])
+    run, _ = runner(cfg, vectors)
+    scheduler = TopicScheduler(run, rdb, interval=3600)
+    assert scheduler.due_projects() == [project_id]
+    assert scheduler.tick() == 1
+    assert scheduler.due_projects() == []
+    topics = ch.query(
+        "SELECT count() FROM topics FINAL WHERE project_id = {p:UInt32} AND active = 1",
+        parameters={"p": project_id},
+    ).result_rows[0][0]
+    assert topics >= 1
+    assert scheduler.tick() == 0  # nothing new
+
+    # new texts within the interval wait for it
+    store_texts(ch, ingestor, project_id, [(t, old) for t in texts_of("lab", 40, 6)])
+    assert scheduler.tick() == 0 and scheduler.due_projects() == [project_id]
+    rdb.delete(f"ai:topics:done:{project_id}")  # the interval has passed
+    assert scheduler.tick() == 1 and scheduler.due_projects() == []
+
+    # a failed run is retried on the next tick
+    store_texts(ch, ingestor, project_id, [("не приходит код подтверждения", NOW)])
+    rdb.delete(f"ai:topics:done:{project_id}")
+    failing = Mock(vectors=vectors, run=Mock(side_effect=RuntimeError("clickhouse is down")))
+    broken = TopicScheduler(failing, rdb, interval=3600)
+    assert broken.tick() == 0 and broken.due_projects() == [project_id]
+    assert scheduler.tick() == 1
 
 
 # --- natural language questions ---------------------------------------------------------

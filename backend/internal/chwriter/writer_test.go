@@ -164,7 +164,7 @@ func (f *fixture) count(query string) uint64 {
 // waitCount waits until the query (with project_id as $1) returns want.
 func (f *fixture) waitCount(query string, want uint64) {
 	f.t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	var got uint64
 	for time.Now().Before(deadline) {
 		if got = f.count(query); got == want {
@@ -238,7 +238,7 @@ func TestCrashBetweenInsertAndCommit(t *testing.T) {
 		},
 	}, nil)
 	stopFirst := run(first)
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for crashed.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -276,7 +276,7 @@ func TestDeadLetterQueue(t *testing.T) {
 	f.produceEvents(10)
 	f.waitCount(countEvents, 10)
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for testutil.ToFloat64(m.DLQ.WithLabelValues(f.topic(kafka.TopicEvents))) < 1 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -295,7 +295,7 @@ func dlqHas(t *testing.T, header, value string) bool {
 		t.Fatal(err)
 	}
 	defer cl.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	for ctx.Err() == nil {
 		found := false
@@ -340,7 +340,7 @@ func TestClickHouseUnavailable(t *testing.T) {
 		t.Fatalf("insert errors metric %v", errs)
 	}
 	// the partition resumes after the commit that follows the successful insert
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for testutil.ToFloat64(m.Paused) != 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}

@@ -7,7 +7,8 @@ Go-модуль с сервисами Botsight:
 | `api` | control plane дашборда на PostgreSQL: регистрация и вход, проекты, участники, API-ключи, сохранённые воронки, расходы на рекламу | разделы 12.4, 13.3, 16.3 [Botsight.md](../Botsight.md), [api/openapi.yaml](api/openapi.yaml) |
 | `collector` | принимает батчи событий от SDK (`POST /v1/batch`) и пишет их в Kafka | раздел 10 |
 | `chwriter` | переносит события из Kafka в ClickHouse пачками, без потерь и дублей | раздел 11 |
-| `loadgen` | генератор нагрузки в формате SDK со сверкой результата; `-texts` добавляет тексты сообщений для AI-модуля | раздел 18 |
+| `antifraud` | оценивает долю ботоферм по источникам трафика: признаки пользователей из потока, скоринг раз в минуту, алерты | раздел 15 |
+| `loadgen` | генератор нагрузки в формате SDK со сверкой результата; `-texts` добавляет тексты сообщений для AI-модуля, `-fraud 0.2` — ботофермы для антифрода | раздел 18 |
 
 AI-модуль (`ai-worker`) написан на Python и лежит в [`../ai`](../ai/README.md).
 
@@ -26,6 +27,7 @@ docker compose -f deploy/docker-compose.yml up --build
 | http://localhost:8080 | API (`/healthz`, `/readyz`, `/v1/...`) |
 | http://localhost:8081 | collector: `POST /v1/batch` для SDK, `/metrics` |
 | http://localhost:8082 | ch-writer: `/readyz`, `/metrics` |
+| http://localhost:8083 | antifraud: `/readyz`, `/metrics` |
 | http://localhost:8025 | Mailpit: письма подтверждения почты и сброса пароля |
 | http://localhost:8123 | ClickHouse (HTTP), база `botsight`, пользователь и пароль `botsight` |
 | localhost:9094 | Kafka |
@@ -135,6 +137,28 @@ INGEST_RATE=10000000 INGEST_BURST=10000000 docker compose -f deploy/docker-compo
 | `CHWRITER_BATCH_ROWS` | `50000` | строк в одной вставке |
 | `CHWRITER_FLUSH_INTERVAL` | `1s` | максимальный возраст записи в буфере |
 | `KAFKA_CREATE_TOPICS`, `KAFKA_REPLICATION_FACTOR` | `true`, `1` | как у collector |
+
+## Настройки `antifraud`
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `REDIS_URL`, `KAFKA_BROKERS`, `CLICKHOUSE_ADDR` | — | обязательны |
+| `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | `botsight`, `default`, пусто | доступ к ClickHouse |
+| `ANTIFRAUD_ADDR` | `:8083` | `/healthz`, `/readyz`, `/metrics` |
+| `ANTIFRAUD_GROUP` | `antifraud` | consumer group |
+| `ANTIFRAUD_REPLAY` | `24h` | сколько перечитывать при назначении партиции: так восстанавливается состояние в памяти |
+| `ANTIFRAUD_FLUSH_INTERVAL` | `10s` | как часто писать изменившиеся признаки в `user_features` |
+| `ANTIFRAUD_MAX_USERS` | `5000000` | пользователей в памяти одного инстанса |
+| `ANTIFRAUD_RUN_INTERVAL` | `1m` | как часто пересчитывать оценки |
+| `ANTIFRAUD_GRAPH_EVERY` | `5` | реферальный граф пересобирается на каждом n-м запуске (в docker compose — на каждом) |
+
+Проверить на ботофермах при запущенном docker compose:
+
+```bash
+go run ./cmd/loadgen -projects 3 -users 600 -rate 3000 -duration 30s -fraud 0.2
+```
+
+Через минуту `GET /v1/projects/{id}/antifraud` покажет долю подозрительных по источникам (войдите под аккаунтом, который напечатал `loadgen`).
 
 ## Миграции
 
