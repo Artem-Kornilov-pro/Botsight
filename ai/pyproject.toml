@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "botsight-ai"
+version = "0.1.0"
+description = "Botsight ai-worker: message topics, natural language questions, anomalies"
+requires-python = ">=3.12"
+dependencies = [
+    "fastembed>=0.9,<1",
+    "qdrant-client>=1.19,<2",
+    "clickhouse-connect>=0.8",
+    "confluent-kafka>=2.5",
+    "redis>=5",
+    "scikit-learn>=1.5",
+    "numpy>=2",
+    "sqlglot>=25",
+    "httpx>=0.27",
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "prometheus-client>=0.20",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "testcontainers>=4.8", "ruff>=0.6", "mypy>=1.11"]
+
+[project.scripts]
+botsight-ai = "botsight_ai.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["botsight_ai"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs Docker (ClickHouse, Qdrant, Redis in containers)",
+    "model: downloads the real embedding model (~220 MB)",
+]
+addopts = "-m 'not model'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+# Russian text is expected; long lines are prompt prose, code is wrapped by ruff format
+ignore = ["RUF001", "RUF002", "RUF003", "E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["botsight_ai"]
+
+[[tool.mypy.overrides]]
+module = ["fastembed.*", "sklearn.*", "confluent_kafka.*", "clickhouse_connect.*", "sqlglot.*"]
+ignore_missing_imports = true

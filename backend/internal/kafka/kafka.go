@@ -19,6 +19,7 @@ const (
 	TopicTexts   = "messages.text"
 	TopicBatches = "ingest.batches"
 	TopicDLQ     = "events.dlq"
+	TopicAlerts  = "alerts"
 )
 
 // Topic is the desired configuration of a topic.
@@ -36,6 +37,7 @@ func Topics() []Topic {
 		{Name: TopicTexts, Partitions: 12, Retention: 24 * time.Hour},
 		{Name: TopicBatches, Partitions: 6, Retention: 72 * time.Hour},
 		{Name: TopicDLQ, Partitions: 3, Retention: 7 * 24 * time.Hour},
+		{Name: TopicAlerts, Partitions: 3, Retention: 7 * 24 * time.Hour},
 	}
 }
 

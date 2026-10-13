@@ -170,6 +170,18 @@ type BatchMeta struct {
 	Dropped          uint32 `json:"dropped"`
 }
 
+// Alert is the value of the alerts topic, produced by ai-worker: topic trends and
+// anomalies (Botsight.md, 14.1, 14.3). Details is a JSON document with the facts.
+type Alert struct {
+	ProjectID uint32 `json:"project_id"`
+	AlertID   string `json:"alert_id"`
+	Kind      string `json:"kind"`
+	CreatedAt int64  `json:"created_at"` // unix ms
+	Title     string `json:"title"`
+	Text      string `json:"text"`
+	Details   string `json:"details"`
+}
+
 // Normalizer turns SDK events into records for one batch.
 type Normalizer struct {
 	ProjectID  uint32

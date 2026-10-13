@@ -5,6 +5,8 @@
 #   Mailpit     http://localhost:8025  (emails sent by the api)
 #   ClickHouse  http://localhost:8123  (user and password: botsight)
 #   Kafka       localhost:9094
+#   ai-worker   http://localhost:8090  (/readyz, /metrics; /internal/ask is called by the api)
+#   Qdrant      http://localhost:6333  (message vectors)
 # Data path: SDK -> collector -> Kafka -> ch-writer -> ClickHouse (Botsight.md, 7.3).
 name: botsight
 
@@ -86,6 +88,13 @@ services:
       timeout: 3s
       retries: 30
 
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
   migrate:
     image: migrate/migrate:v4.18.1
     volumes:
@@ -116,11 +125,18 @@ services:
       COOKIE_SECURE: "false" # plain http locally
       SMTP_ADDR: mailpit:1025
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      CLICKHOUSE_ADDR: clickhouse:9000
+      CLICKHOUSE_USER: botsight
+      CLICKHOUSE_PASSWORD: botsight
+      AI_URL: http://ai-worker:8090
+      AI_INTERNAL_TOKEN: dev-internal-token
       LOG_LEVEL: debug
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      migrate-clickhouse:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
@@ -171,6 +187,36 @@ services:
       kafka:
         condition: service_healthy
 
+  ai-worker:
+    build:
+      context: ../ai
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: botsight
+      CLICKHOUSE_PASSWORD: botsight
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+      AI_INTERNAL_TOKEN: dev-internal-token # shared with the api service
+      AI_NL_PASSWORD_SECRET: dev-nl-password-secret
+      AI_TOPICS_INTERVAL_SECONDS: ${AI_TOPICS_INTERVAL_SECONDS:-3600}
+      # an OpenAI-compatible LLM, e.g. Ollama on the host: http://host.docker.internal:11434/v1
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+    ports:
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      migrate-clickhouse:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
 volumes:
   postgres-data:
   clickhouse-data:
+  qdrant-data:

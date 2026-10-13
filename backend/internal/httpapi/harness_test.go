@@ -33,7 +33,7 @@ var (
 
 func TestMain(m *testing.M) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	env, envErr = testenv.Start(ctx)
+	env, envErr = testenv.StartWith(ctx, testenv.Options{Postgres: true, Redis: true, ClickHouse: true})
 	cancel()
 	code := m.Run()
 	if env != nil {
@@ -98,11 +98,21 @@ func noLimits() httpapi.Limits {
 	return httpapi.Limits{
 		LoginIP: big("t:login:ip"), LoginAccount: big("t:login:account"), RegisterIP: big("t:register"),
 		TelegramIP: big("t:telegram"), ResetIP: big("t:reset:ip"), ResetEmail: big("t:reset:email"),
-		VerifyAccount: big("t:verify"),
+		VerifyAccount: big("t:verify"), AskAccount: big("t:ask"),
 	}
 }
 
 func newHarness(t *testing.T, configure ...func(*httpapi.Options)) *harness {
+	t.Helper()
+	return newHarnessDeps(t, func(d *httpapi.Deps) {
+		for _, c := range configure {
+			c(&d.Options)
+		}
+	})
+}
+
+// newHarnessDeps also lets a test replace dependencies, e.g. turn ClickHouse off.
+func newHarnessDeps(t *testing.T, mutate func(*httpapi.Deps)) *harness {
 	t.Helper()
 	requireEnv(t)
 	opts := httpapi.Options{
@@ -113,19 +123,19 @@ func newHarness(t *testing.T, configure ...func(*httpapi.Options)) *harness {
 		TelegramToken: botToken,
 		Limits:        noLimits(),
 	}
-	for _, c := range configure {
-		c(&opts)
-	}
 	h := &harness{t: t, mailer: &fakeMailer{}, store: store.New(env.Pool)}
-	h.api = httpapi.New(httpapi.Deps{
-		Store:    h.store,
-		Sessions: session.NewStore(env.Redis, opts.SessionTTL),
-		Limiter:  ratelimit.NewWindow(env.Redis),
-		Redis:    env.Redis,
-		Mailer:   h.mailer,
-		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Options:  opts,
-	})
+	deps := httpapi.Deps{
+		Store:      h.store,
+		Limiter:    ratelimit.NewWindow(env.Redis),
+		Redis:      env.Redis,
+		Mailer:     h.mailer,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ClickHouse: env.ClickHouse,
+		Options:    opts,
+	}
+	mutate(&deps)
+	deps.Sessions = session.NewStore(env.Redis, deps.Options.SessionTTL)
+	h.api = httpapi.New(deps)
 	h.srv = httptest.NewServer(h.api.Handler())
 	t.Cleanup(func() {
 		h.srv.Close()

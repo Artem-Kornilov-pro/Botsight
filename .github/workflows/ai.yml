@@ -1,0 +1,36 @@
+name: ai
+
+on:
+  push:
+    branches: [main]
+    paths: ["ai/**", "migrations/clickhouse/**", ".github/workflows/ai.yml"]
+  pull_request:
+    paths: ["ai/**", "migrations/clickhouse/**", ".github/workflows/ai.yml"]
+
+defaults:
+  run:
+    working-directory: ai
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      AI_MODEL_CACHE: /home/runner/.cache/botsight-models
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ai/pyproject.toml
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+      - name: embedding model cache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/botsight-models
+          key: fastembed-paraphrase-multilingual-MiniLM-L12-v2
+      # unit, integration (ClickHouse, Qdrant, Redis in containers) and the real model
+      - run: pytest -m "model or not model"

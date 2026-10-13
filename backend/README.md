@@ -7,7 +7,9 @@ Go-модуль с сервисами Botsight:
 | `api` | control plane дашборда на PostgreSQL: регистрация и вход, проекты, участники, API-ключи, сохранённые воронки, расходы на рекламу | разделы 12.4, 13.3, 16.3 [Botsight.md](../Botsight.md), [api/openapi.yaml](api/openapi.yaml) |
 | `collector` | принимает батчи событий от SDK (`POST /v1/batch`) и пишет их в Kafka | раздел 10 |
 | `chwriter` | переносит события из Kafka в ClickHouse пачками, без потерь и дублей | раздел 11 |
-| `loadgen` | генератор нагрузки в формате SDK со сверкой результата | раздел 18 |
+| `loadgen` | генератор нагрузки в формате SDK со сверкой результата; `-texts` добавляет тексты сообщений для AI-модуля | раздел 18 |
+
+AI-модуль (`ai-worker`) написан на Python и лежит в [`../ai`](../ai/README.md).
 
 ## Локальный запуск
 
@@ -102,6 +104,9 @@ INGEST_RATE=10000000 INGEST_BURST=10000000 docker compose -f deploy/docker-compo
 | `SMTP_FROM` | `Botsight <no-reply@botsight.ru>` | отправитель писем |
 | `SMTP_USERNAME`, `SMTP_PASSWORD` | пусто | авторизация на SMTP-сервере |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `CLICKHOUSE_ADDR`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | пусто, `botsight`, `default`, пусто | ClickHouse для тем и алертов; без адреса эти эндпоинты отвечают `503` |
+| `AI_URL` | пусто | адрес `ai-worker` для `POST /ask`; пусто — вопросы выключены |
+| `AI_INTERNAL_TOKEN` | пусто | общий с `ai-worker` токен |
 
 ## Настройки `collector`
 

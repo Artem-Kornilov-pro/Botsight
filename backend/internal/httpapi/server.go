@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/redis/go-redis/v9"
@@ -27,6 +28,8 @@ type Options struct {
 	SessionTTL    time.Duration
 	TrustProxy    bool   // client IP from X-Forwarded-For / X-Real-IP
 	TelegramToken string // empty disables Telegram sign-in
+	AIURL         string // ai-worker base URL; empty disables natural language questions
+	AIToken       string // shared with ai-worker
 	Limits        Limits
 }
 
@@ -39,6 +42,7 @@ type Limits struct {
 	ResetIP       ratelimit.Rule
 	ResetEmail    ratelimit.Rule
 	VerifyAccount ratelimit.Rule
+	AskAccount    ratelimit.Rule // questions to the LLM cost money
 }
 
 func DefaultLimits() Limits {
@@ -50,6 +54,7 @@ func DefaultLimits() Limits {
 		ResetIP:       ratelimit.Rule{Name: "reset:ip", Limit: 10, Period: time.Hour},
 		ResetEmail:    ratelimit.Rule{Name: "reset:email", Limit: 3, Period: time.Hour},
 		VerifyAccount: ratelimit.Rule{Name: "verify:account", Limit: 3, Period: time.Hour},
+		AskAccount:    ratelimit.Rule{Name: "ask:account", Limit: 30, Period: time.Hour},
 	}
 }
 
@@ -60,7 +65,11 @@ type Deps struct {
 	Redis    redis.UniversalClient // key revocation Pub/Sub and readiness
 	Mailer   mail.Mailer
 	Logger   *slog.Logger
-	Options  Options
+	// ClickHouse holds AI topics and alerts; nil turns those endpoints off (503).
+	ClickHouse driver.Conn
+	// HTTPClient calls ai-worker; nil means a client with a 60 s timeout.
+	HTTPClient *http.Client
+	Options    Options
 }
 
 type Server struct {
@@ -70,6 +79,9 @@ type Server struct {
 }
 
 func New(d Deps) *Server {
+	if d.HTTPClient == nil {
+		d.HTTPClient = &http.Client{Timeout: 60 * time.Second}
+	}
 	s := &Server{Deps: d}
 	s.ready.Store(true)
 	return s
@@ -162,6 +174,11 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/ad-spend", s.listAdSpend)
 				r.With(editor).Post("/ad-spend", s.createAdSpend)
 				r.With(editor).Delete("/ad-spend/{spendID}", s.deleteAdSpend)
+
+				r.Get("/topics", s.listTopics)
+				r.Get("/topics/{topicID}/examples", s.topicExamples)
+				r.Get("/alerts", s.listAlerts)
+				r.Post("/ask", s.ask)
 			})
 		})
 	})

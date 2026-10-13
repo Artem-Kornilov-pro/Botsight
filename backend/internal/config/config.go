@@ -25,6 +25,14 @@ type API struct {
 	SMTPUsername  string        // SMTP_USERNAME
 	SMTPPassword  string        // SMTP_PASSWORD
 	LogLevel      string        // LOG_LEVEL: debug, info, warn, error
+
+	// ClickHouse for AI topics and alerts; empty CLICKHOUSE_ADDR turns these endpoints off.
+	ClickHouseAddr     string // CLICKHOUSE_ADDR host:9000
+	ClickHouseDatabase string // CLICKHOUSE_DATABASE, default botsight
+	ClickHouseUser     string // CLICKHOUSE_USER, default default
+	ClickHousePassword string // CLICKHOUSE_PASSWORD
+	AIURL              string // AI_URL of ai-worker for /ask; empty turns questions off
+	AIInternalToken    string // AI_INTERNAL_TOKEN shared with ai-worker
 }
 
 func LoadAPI() (API, error) {
@@ -39,6 +47,13 @@ func LoadAPI() (API, error) {
 		SMTPUsername:  os.Getenv("SMTP_USERNAME"),
 		SMTPPassword:  os.Getenv("SMTP_PASSWORD"),
 		LogLevel:      env("LOG_LEVEL", "info"),
+
+		ClickHouseAddr:     os.Getenv("CLICKHOUSE_ADDR"),
+		ClickHouseDatabase: env("CLICKHOUSE_DATABASE", "botsight"),
+		ClickHouseUser:     env("CLICKHOUSE_USER", "default"),
+		ClickHousePassword: os.Getenv("CLICKHOUSE_PASSWORD"),
+		AIURL:              strings.TrimRight(os.Getenv("AI_URL"), "/"),
+		AIInternalToken:    os.Getenv("AI_INTERNAL_TOKEN"),
 	}
 	var err error
 	if c.CookieSecure, err = envBool("COOKIE_SECURE", true); err != nil {

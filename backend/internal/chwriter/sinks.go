@@ -26,7 +26,7 @@ func (s Sink) insertSQL() string {
 
 // Sinks are the topics ch-writer consumes.
 func Sinks() []Sink {
-	return []Sink{EventsSink(), TextsSink(), BatchesSink()}
+	return []Sink{EventsSink(), TextsSink(), BatchesSink(), AlertsSink()}
 }
 
 var errInvalidRecord = errors.New("invalid record")
@@ -112,6 +112,24 @@ func BatchesSink() Sink {
 				b.ProjectID, b.BatchID, ms(b.ReceivedAt), b.SDKName, b.SDKVersion, b.Framework,
 				b.FrameworkVersion, b.Events, b.Rejected, b.Dropped,
 			}, nil
+		},
+	}
+}
+
+func AlertsSink() Sink {
+	return Sink{
+		Topic:   kafka.TopicAlerts,
+		Table:   "alerts",
+		Columns: []string{"project_id", "alert_id", "kind", "created_at", "title", "text", "details"},
+		Row: func(value []byte) ([]any, error) {
+			var a event.Alert
+			if err := json.Unmarshal(value, &a); err != nil {
+				return nil, err
+			}
+			if a.ProjectID == 0 || !event.IsUUID(a.AlertID) || a.Kind == "" || a.CreatedAt == 0 {
+				return nil, errInvalidRecord
+			}
+			return []any{a.ProjectID, a.AlertID, a.Kind, ms(a.CreatedAt), a.Title, a.Text, a.Details}, nil
 		},
 	}
 }
