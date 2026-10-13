@@ -254,28 +254,35 @@ dp.include_router(router)
 setup(dp, bot, api_key=os.environ["BOTSIGHT_KEY"])
 ```
 
-`setup()` нужно вызывать **после** `include_router(...)`. Причина: при `track_blocks=True` SDK добавляет собственный роутер для апдейтов `my_chat_member`, и этот роутер должен быть последним, чтобы не перехватывать хендлеры бота (aiogram проверяет хендлеры роутеров в порядке подключения). Кроме того, aiogram по умолчанию запрашивает у Telegram только те типы апдейтов, для которых есть хендлеры (`resolve_used_update_types()`), и делает это до вызова startup-хуков. Поэтому роутер должен быть подключён до `start_polling`.
+`setup()` нужно вызвать **до** `start_polling`. aiogram по умолчанию запрашивает у Telegram только те типы апдейтов, для которых есть хендлеры (`resolve_used_update_types()`), и делает это до вызова startup-хуков. При `track_blocks=True` SDK подключает собственный роутер с хендлером `my_chat_member`, и к этому моменту он уже должен быть подключён. Порядок относительно `include_router(...)` не важен: хендлер SDK пропускает апдейт дальше (`SkipHandler`) и не перехватывает хендлеры бота (раздел 8.6).
+
+Неверные параметры вызывают исключение сразу в `setup()`, при запуске бота. После запуска SDK исключений в код бота не бросает. Повторный вызов `setup()` для того же диспетчера возвращает уже созданный клиент.
 
 ### 8.2. Что делает `setup()`
 
 ```python
 def setup(dp: Dispatcher, bot: Bot, api_key: str, **options) -> Botsight:
-    client = Botsight(api_key, **options)
+    client = Botsight(api_key, bot_id=bot.id, **options)     # проверка параметров
+    dp["botsight"] = client                                   # доступ из хендлеров для track()
+    if not client.options.enabled:
+        return client
 
     dp.update.outer_middleware(UpdateMiddleware(client))     # 1. все входящие апдейты
     steps = StepMiddleware(client)
     dp.message.middleware(steps)                              # 2. шаги FSM и хендлеры
     dp.callback_query.middleware(steps)
+    dp.pre_checkout_query.middleware(steps)
     bot.session.middleware(OutgoingMiddleware(client))        # 3. исходящие запросы к Bot API
 
     if client.options.track_blocks:
-        dp.include_router(_blocks_router())                   # подписка на my_chat_member
+        dp.include_router(blocks_router())                    # подписка на my_chat_member
 
     dp.startup.register(client.start)                         # запуск фоновой отправки
     dp.shutdown.register(client.close)                        # дослать события при остановке
-    dp["botsight"] = client                                   # доступ из хендлеров для track()
     return client
 ```
+
+`bot_id` берётся из `bot.id`: это часть токена до двоеточия, сам токен никуда не передаётся. Для апдейтов используется бот из контекста апдейта, поэтому несколько ботов на одном диспетчере тоже различаются.
 
 Inner-middleware, зарегистрированные на диспетчере, aiogram применяет и к хендлерам во вложенных роутерах (`TelegramEventObserver._resolve_middlewares` проходит по цепочке роутеров от корня), поэтому регистрации на `dp` достаточно.
 
@@ -289,62 +296,62 @@ class UpdateMiddleware(BaseMiddleware):
         self.client = client
 
     async def __call__(self, handler, update: Update, data: dict):
-        t0 = time.monotonic()
+        ctx = UpdateContext()                             # общий с хуком шагов этого апдейта
+        data["botsight_update_ctx"] = ctx
+        t0 = time.perf_counter()
         result = UNHANDLED
         failed = False
         try:
             result = await handler(update, data)
             return result
-        except Exception:
+        except BaseException:
             failed = True                                 # хендлер нашёлся, но упал
             raise
         finally:
-            self.client.emit_update(
-                update,
-                user=data.get("event_from_user"),
-                chat=data.get("event_chat"),
-                state=data.get("raw_state"),
-                handled=failed or result is not UNHANDLED,  # False — не подошёл ни один хендлер
-                duration_ms=int((time.monotonic() - t0) * 1000),
-            )
+            try:
+                self._record(update, data, ctx,
+                             handled=failed or result is not UNHANDLED,
+                             duration_ms=int((time.perf_counter() - t0) * 1000))
+            except Exception:
+                log_limited(...)                          # ошибка SDK не доходит до бота
 ```
 
-Из апдейта извлекаются: тип (`update.event_type`), тип содержимого (`message.content_type`), команда и параметр deep link для `/start` (до 64 символов), `callback_data`, длина текста, язык и премиум-статус пользователя, наличие username. Текст — только при `capture_text=True` и только если текущее состояние не входит в `skip_text_in_states`.
+Из апдейта извлекаются: тип (`update.event_type`), тип содержимого (`message.content_type`), команда и параметр deep link для `/start` (до 64 символов), `callback_data`, новый статус бота для `my_chat_member` (`member_status`), длина текста или подписи, язык и премиум-статус пользователя, наличие username. Текст — только при `capture_text=True` и только если текущее состояние не входит в `skip_text_in_states`.
+
+Апдейт считается необработанным (`handled = false`), если не подошёл ни один хендлер или сработал хендлер из `fallback_handlers` (запасной хендлер «не понял»). Сработавший хендлер узнаёт хук шагов (раздел 8.4), а результат он передаёт через `UpdateContext`.
 
 ### 8.4. Хук 2: шаги FSM и хендлеры
 
-Inner-middleware на `message` и `callback_query` вызывается после фильтров, поэтому знает, какой хендлер сработал (`data["handler"]`).
+Inner-middleware на `message`, `callback_query` и `pre_checkout_query` вызывается после фильтров, поэтому знает, какой хендлер сработал (`data["handler"]`). `pre_checkout_query` нужен для воронки оплаты.
 
 ```python
 class StepMiddleware(BaseMiddleware):
-    def __init__(self, client: Botsight):
-        self.client = client
-
     async def __call__(self, handler, event, data: dict):
-        state: FSMContext | None = data.get("state")
         before = data.get("raw_state")                    # уже прочитано aiogram, бесплатно
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         error = None
+        skipped = False
         try:
             return await handler(event, data)
+        except (SkipHandler, CancelHandler):
+            skipped = True                                # хендлер отказался: это не шаг
+            raise
         except Exception as exc:
             error = type(exc).__name__
             raise                                         # исключение бота не глотаем
         finally:
-            after = await state.get_state() if state else None
-            cb = data["handler"].callback
-            self.client.emit_step(
-                user=data.get("event_from_user"),
-                chat=data.get("event_chat"),
-                handler=f"{cb.__module__}:{cb.__qualname__}",
-                state_from=before,
-                state_to=after,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                error=error,
-            )
+            if not skipped:
+                try:
+                    # имя хендлера, отметка fallback, чтение state после хендлера
+                    await self._record(event, data, before,
+                                       int((time.perf_counter() - t0) * 1000), error)
+                except Exception:
+                    log_limited(...)
 ```
 
-Стоимость: одно дополнительное чтение состояния после хендлера. С `MemoryStorage` это обращение к словарю, с `RedisStorage` — один запрос к Redis на апдейт. Отключается параметром `track_fsm=False`.
+Имя хендлера — `module:qualname`. Оно определяется и для `functools.partial`, методов и хендлеров-классов.
+
+Стоимость: одно дополнительное чтение состояния после хендлера. С `MemoryStorage` это обращение к словарю, с `RedisStorage` — один запрос к Redis на апдейт. Отключается параметром `track_fsm=False`: тогда события `step` отправляются с пустыми `state_from` и `state_to`. Если чтение состояния упало (например, Redis недоступен), шаг тоже отправляется без состояний, чтобы не появилось ложного «застрял на шаге».
 
 ### 8.5. Хук 3: исходящие запросы
 
@@ -358,18 +365,17 @@ class OutgoingMiddleware(BaseRequestMiddleware):
     async def __call__(self, make_request, bot, method):
         if isinstance(method, GetUpdates):                # long polling не интересен
             return await make_request(bot, method)
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         try:
             response = await make_request(bot, method)
-        except TelegramAPIError as exc:
-            self.client.emit_outgoing(method, error=exc,
-                                      duration_ms=int((time.monotonic() - t0) * 1000))
+        except Exception as exc:                          # любое исключение: записать и пробросить
+            self._record(bot, method, int((time.perf_counter() - t0) * 1000), exc)
             raise
-        self.client.emit_outgoing(method, duration_ms=int((time.monotonic() - t0) * 1000))
+        self._record(bot, method, int((time.perf_counter() - t0) * 1000), None)
         return response
 ```
 
-Извлекаются: имя метода (`method.__api_method__`: `sendMessage`, `sendDocument`, `editMessageText`), `chat_id`, длительность, код и нормализованный тип ошибки. Содержимое сообщений и файлов не читается.
+Извлекаются: имя метода (`method.__api_method__`: `sendMessage`, `sendDocument`, `editMessageText`), `chat_id`, длительность, код и нормализованный тип ошибки. Содержимое сообщений и файлов не читается. `chat_id` вида `@channel` передаётся как `0`, потому что в схеме это int64.
 
 Нормализация ошибок:
 
@@ -377,20 +383,31 @@ class OutgoingMiddleware(BaseRequestMiddleware):
 |---|---|---|
 | `TelegramForbiddenError`, «bot was blocked by the user» | 403 | `bot_blocked` |
 | `TelegramForbiddenError`, «user is deactivated» | 403 | `user_deactivated` |
+| `TelegramForbiddenError`, прочее | 403 | `forbidden` |
 | `TelegramRetryAfter` | 429 | `rate_limited` |
+| `TelegramMigrateToChat` | 400 | `migrated` |
 | `TelegramBadRequest`, «message is not modified» | 400 | `not_modified` |
 | `TelegramBadRequest`, прочее | 400 | `bad_request` |
-| `TelegramServerError` | 5xx | `server_error` |
+| `TelegramUnauthorizedError` | 401 | `unauthorized` |
+| `TelegramNotFound` | 404 | `not_found` |
+| `TelegramConflictError` | 409 | `conflict` |
+| `TelegramEntityTooLarge` | 413 | `entity_too_large` |
+| `TelegramServerError` | 500 | `server_error` |
 | `TelegramNetworkError` | 0 | `network` |
+| `ClientDecodeError` (ответ Telegram не разобран) | 0 | `decode_error` |
+| прочий `TelegramAPIError` | 0 | `api_error` |
+| любое другое исключение | 0 | `unknown` |
+
+Успешный запрос: `ok = true`, `error_code = 0`, `error = null`.
 
 ### 8.6. Обнаружение блокировок
 
 Два независимых источника:
 
 1. **Ошибка 403 `bot_blocked`** при отправке сообщения. Работает всегда, но только когда бот пытается написать пользователю.
-2. **Апдейт `my_chat_member`** со статусом `kicked` в личном чате. Telegram присылает его сразу при блокировке, но только если бот подписан на этот тип апдейтов. При `track_blocks=True` SDK подключает роутер с пустым хендлером `my_chat_member`, и aiogram добавляет этот тип в `allowed_updates`. Если бот уже обрабатывает `my_chat_member` сам, его хендлер срабатывает первым, а роутер SDK, подключённый последним, не мешает.
+2. **Апдейт `my_chat_member`** со статусом `kicked` в личном чате (`member_status = "kicked"` в событии `update`). Telegram присылает его сразу при блокировке, но только если бот подписан на этот тип апдейтов. При `track_blocks=True` SDK подключает роутер с хендлером `my_chat_member`, и aiogram добавляет этот тип в `allowed_updates`. Сам апдейт записывает хук входящих апдейтов, а хендлер SDK только отмечает, что апдейт ожидаемый, и бросает `SkipHandler`. Поэтому хендлеры бота для `my_chat_member` срабатывают при любом порядке роутеров, а апдейт, который бот сам не обрабатывает, не считается необработанным.
 
-Для ботов на вебхуках `allowed_updates` задаёт владелец в `set_webhook`. В документации SDK для них будет отдельная инструкция.
+Для ботов на вебхуках `allowed_updates` задаёт владелец в `set_webhook`, например `allowed_updates=dp.resolve_used_update_types()` после `setup()`. Инструкция — в README пакета.
 
 ### 8.7. Ручные события
 
@@ -409,34 +426,35 @@ async def cb_generate(cb: CallbackQuery, state: FSMContext, botsight: Botsight):
     })
 ```
 
-Клиент попадает в хендлер через встроенное внедрение зависимостей aiogram (`dp["botsight"] = client`), так же как в labbot передаются `quota` и `admins`.
+Клиент попадает в хендлер через встроенное внедрение зависимостей aiogram (`dp["botsight"] = client`), так же как в labbot передаются `quota` и `admins`. Вне хендлеров можно вызвать `botsight.track(...)` на уровне модуля: он использует клиент из последнего `setup()`, а без `setup()` ничего не делает. Вместо `user_id` можно передать сам объект `User`.
 
-Правила для ручных событий: имя в `snake_case` до 64 символов, не больше 32 свойств, строки до 1024 символов. Числа и строки хранятся в разных колонках, чтобы по числам можно было считать суммы и перцентили.
+Правила для ручных событий: имя в `snake_case` до 64 символов, не больше 32 свойств, строки до 1024 символов. Числа и строки хранятся в разных колонках, чтобы по числам можно было считать суммы и перцентили. `bool` превращается в строку `"true"`/`"false"`, `None` и `NaN` пропускаются, остальные значения приводятся к строке. Событие с неверным именем отбрасывается, лишние свойства обрезаются, а в лог пишется предупреждение. Исключений `track()` не бросает.
 
 ### 8.8. Доставка событий
 
 | Механизм | Реализация |
 |---|---|
-| Очередь | `asyncio.Queue(maxsize=10_000)`. События кладутся через `put_nowait`. При переполнении событие выбрасывается, растёт счётчик `dropped`, который уходит в следующем батче и виден в дашборде. |
-| Батчи | Фоновая задача собирает до 500 событий или ждёт 2 секунды, сериализует в JSON и сжимает gzip. HTTP-клиент — `aiohttp`, он уже установлен вместе с aiogram, новых зависимостей нет. |
-| Идентификаторы | `event_id` и `batch_id` — UUIDv7 (упорядочены по времени), генерируются в SDK. В Python 3.14+ используется `uuid.uuid7()`, для более старых версий — своя реализация на 10 строк. |
+| Очередь | `asyncio.Queue(maxsize=10_000)`. События кладутся через `put_nowait`. При переполнении событие выбрасывается, растёт счётчик `dropped`, который уходит в следующем батче и виден в дашборде. В `dropped` попадают и события из батчей, от которых SDK отказался (ответ 400, 10 минут ретраев, слишком большое событие). |
+| Батчи | Фоновая задача собирает до 500 событий или ждёт 2 секунды. Батч ограничен и по размеру: меньше 2 МиБ JSON до сжатия. Подготовка батча (идентификаторы, время, псевдонимизация, `redact`, JSON и gzip) идёт в рабочем потоке (`asyncio.to_thread`), а не в event loop бота. HTTP-клиент — `aiohttp`, он уже установлен вместе с aiogram, новых зависимостей нет. |
+| Размер события | Лимит collector — 16 КиБ на событие. У слишком большого `update` обрезается `text`, слишком большое ручное событие выбрасывается и учитывается в `dropped`. |
+| Идентификаторы | `event_id` и `batch_id` — UUIDv7 (упорядочены по времени), генерируются в SDK. Используется своя реализация на 10 строк для всех версий Python: `event_id` строится от времени события, поэтому упорядочен по моменту события, а не по моменту сборки батча (`uuid.uuid7()` в Python 3.14 время не принимает). |
 | Неизменяемость батча | При повторной отправке уходит тот же `batch_id` с теми же событиями. На этом держится дедупликация на сервере. |
 | Ретраи | Экспоненциальная задержка с полным джиттером от 0,5 до 60 секунд, не дольше 10 минут на батч. Для 429 учитывается заголовок `Retry-After`. |
-| Circuit breaker | После 5 неудачных отправок подряд SDK делает паузу. Очередь продолжает заполняться до лимита. |
-| Остановка | На `dp.shutdown` SDK досылает очередь с таймаутом 5 секунд. |
+| Circuit breaker | После 5 неудачных отправок подряд пауза между попытками не меньше 30 секунд. Очередь продолжает заполняться до лимита. |
+| Остановка | На `dp.shutdown` SDK досылает очередь с таймаутом 5 секунд. Неудачная отправка во время остановки не ретраится. |
 | Изоляция ошибок | Все хуки обёрнуты в `try/except`. Ошибки самого SDK пишутся в лог не чаще раза в минуту и никогда не доходят до кода бота. |
-| Накладные расходы | Цель: меньше 50 мкс на апдейт на горячем пути (сборка словаря и `put_nowait`), сеть — только в фоне. Проверяется бенчмарком в CI. |
+| Накладные расходы | Цель: меньше 50 мкс на апдейт на горячем пути (сборка словаря и `put_nowait`), сеть — только в фоне. Проверяется бенчмарком в CI (`pytest -m benchmark`). Первый замер: около 7 мкс на апдейт со всеми хуками и `MemoryStorage`. |
 
 Реакция SDK на ответы сервера:
 
 | Ответ | Действие SDK |
 |---|---|
 | `202 Accepted` | батч доставлен |
-| `400 Bad Request` | батч выбрасывается, ошибка в лог (это баг SDK или клиента, ретрай не поможет) |
-| `401 Unauthorized` | отправка останавливается до перезапуска, предупреждение в лог один раз |
-| `409 Conflict` | этот же батч сейчас обрабатывается, ретрай позже |
-| `413 Payload Too Large` | батч делится пополам, половинки отправляются как новые батчи |
-| `429 Too Many Requests` | ретрай после `Retry-After` |
+| `400 Bad Request` и прочие 4xx | батч выбрасывается и учитывается в `dropped`, ошибка в лог (это баг SDK или клиента, ретрай не поможет) |
+| `401 Unauthorized` | SDK выключается до перезапуска: хуки перестают собирать события, ошибка в лог один раз |
+| `408`, `409 Conflict` | этот же батч сейчас обрабатывается или запрос не успел, ретрай позже |
+| `413 Payload Too Large` | батч делится пополам, половинки отправляются как новые батчи; одиночное событие выбрасывается |
+| `429 Too Many Requests` | ретрай после `Retry-After` (не больше 10 минут) |
 | `5xx`, таймаут, сеть | ретрай с экспоненциальной задержкой |
 
 ### 8.9. Параметры
@@ -445,17 +463,19 @@ async def cb_generate(cb: CallbackQuery, state: FSMContext, botsight: Botsight):
 |---|---|---|
 | `api_key` | — | ключ проекта из дашборда |
 | `endpoint` | `https://ingest.botsight.ru` | адрес приёма (для self-hosted) |
-| `capture_text` | `False` | отправлять тексты сообщений |
-| `skip_text_in_states` | `set()` | состояния FSM, в которых текст не отправляется даже при `capture_text=True` |
-| `redact` | `None` | функция `(text) -> text` для собственного маскирования |
-| `pseudonymize_user_ids` | `False` | заменять `user_id` на HMAC-SHA256 с секретом проекта (первые 8 байт) |
+| `capture_text` | `False` | отправлять тексты и подписи сообщений (до 4096 символов) |
+| `skip_text_in_states` | `set()` | состояния FSM, в которых текст не отправляется даже при `capture_text=True`. Строки `"Form:name"`, объекты `State` или целый `StatesGroup` |
+| `redact` | `None` | функция `(text) -> text` для собственного маскирования. Вызывается в фоновом потоке. Если она упала, текст не отправляется |
+| `pseudonymize_user_ids` | `False` | заменять `user_id` и `chat_id` личных чатов на HMAC-SHA256 с `pseudonymize_secret`: первые 8 байт со сброшенным старшим битом, чтобы значение помещалось в int64 |
+| `pseudonymize_secret` | — | секрет для HMAC, обязателен при `pseudonymize_user_ids=True`. Хранится у владельца бота. Его нельзя менять: вместе с ним сменятся все псевдонимы |
 | `track_fsm` | `True` | отслеживать переходы состояний |
 | `track_blocks` | `True` | подписаться на `my_chat_member` |
-| `batch_size` | `500` | максимум событий в батче |
+| `fallback_handlers` | `()` | запасные хендлеры («не понял»). Апдейт, который попал в них, считается необработанным. Сами функции или строки `"module:qualname"` |
+| `batch_size` | `500` | максимум событий в батче (1–500) |
 | `flush_interval` | `2.0` | максимум секунд между отправками |
 | `max_queue` | `10_000` | лимит очереди в памяти |
-| `sample_rate` | `1.0` | доля пользователей, по которым собираются события (выборка по хешу `user_id`, чтобы воронки оставались целыми) |
-| `enabled` | `True` | выключить SDK, например в тестах |
+| `sample_rate` | `1.0` | доля пользователей, по которым собираются события (выборка по хешу `user_id`, чтобы воронки оставались целыми; для исходящих запросов — по `chat_id`). События без пользователя (`lifecycle`) отправляются всегда |
+| `enabled` | `True` | выключить SDK, например в тестах. Хуки не ставятся, `track()` ничего не делает, но `botsight` по-прежнему передаётся в хендлеры |
 
 ## 9. Формат событий
 
@@ -493,6 +513,8 @@ async def cb_generate(cb: CallbackQuery, state: FSMContext, botsight: Botsight):
 | `user_id` | int64 | id пользователя Telegram или его псевдоним |
 | `chat_id` | int64 | id чата (отрицательный для групп) |
 
+Общие поля есть у каждого события; если пользователя или чата нет, передаётся `0`. Необязательные поля, неприменимые к событию (`content_type`, `command`, `start_param`, `callback_data`, `member_status`, `text`, `user`), не передаются вовсе. Сервер хранит их как `''` и `0`.
+
 ### 9.3. Типы событий
 
 **`update`** — входящий апдейт:
@@ -518,9 +540,9 @@ async def cb_generate(cb: CallbackQuery, state: FSMContext, botsight: Botsight):
 }
 ```
 
-Для нажатия кнопки: `"name": "callback_query"`, `"callback_data": "lab:lab2"`.
+Для нажатия кнопки: `"name": "callback_query"`, `"callback_data": "lab:lab2"`. Для изменения статуса бота в чате: `"name": "my_chat_member"`, `"member_status": "kicked"`. В личном чате это означает блокировку.
 
-**`step`** — обработка хендлером:
+**`step`** — обработка хендлером (`name`: `message`, `callback_query` или `pre_checkout_query`):
 
 ```json
 {
@@ -539,7 +561,7 @@ async def cb_generate(cb: CallbackQuery, state: FSMContext, botsight: Botsight):
 }
 ```
 
-**`outgoing`** — запрос к Bot API:
+**`outgoing`** — запрос к Bot API (при успехе `"ok": true`, `"error_code": 0`, `"error": null`):
 
 ```json
 {
@@ -571,11 +593,15 @@ async def cb_generate(cb: CallbackQuery, state: FSMContext, botsight: Botsight):
 }
 ```
 
-**`lifecycle`** — `bot_started` и `bot_stopped` с версиями SDK, фреймворка и Python. На графиках дашборда это отметки деплоев.
+**`lifecycle`** — `bot_started` и `bot_stopped`. Версии SDK, фреймворка и Python лежат в `props` (`sdk_version`, `framework`, `framework_version`, `python_version`). На графиках дашборда это отметки деплоев.
 
 ### 9.4. Тексты
 
 При `capture_text=True` у события `update` появляется поле `text` (до 4096 символов — максимум длины сообщения в Telegram). `collector` вырезает его из основного события и отправляет в отдельный топик `messages.text` (раздел 11). Основной поток событий персональных текстов не содержит.
+
+### 9.5. Эталонный батч
+
+Полный пример батча со всеми типами событий лежит в [`docs/contract/batch_v1.json`](docs/contract/batch_v1.json). Тесты SDK проверяют, что каждое событие содержит ровно поля из этого файла. Тесты `collector` должны разбирать этот же файл. Изменение формата начинается с правки этого файла и раздела 9.
 
 ## 10. Приём событий: collector
 
@@ -1249,7 +1275,7 @@ WHERE project_id = {loadtest_project:UInt32};
 ### 19.1. Минимизация данных
 
 - По умолчанию не собираются тексты, имена, username, телефоны. Передаются только `user_id`, язык, премиум-статус и признак наличия username.
-- `pseudonymize_user_ids=True` заменяет `user_id` на HMAC с секретом проекта: аналитика работает, а связать данные с аккаунтом Telegram без секрета нельзя.
+- `pseudonymize_user_ids=True` заменяет `user_id` и `chat_id` личных чатов на HMAC с секретом `pseudonymize_secret`, который хранится только у владельца бота: аналитика работает, а связать данные с аккаунтом Telegram без секрета нельзя.
 - Тексты (если включены): отдельный топик, отдельная таблица, срок хранения 30 дней, исключение состояний (`skip_text_in_states`), маскирование (`redact`).
 
 ### 19.2. 152-ФЗ
@@ -1366,6 +1392,7 @@ botsight/
 │   └── grafana/                # дашборды как код
 ├── loadtest/                   # сценарии k6 и хаос-тестов
 └── docs/
+    └── contract/               # эталонный батч — общий для SDK и collector
 ```
 
 ## 25. Распределение работы
