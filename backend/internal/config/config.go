@@ -86,3 +86,155 @@ func envBool(key string, def bool) (bool, error) {
 	}
 	return b, nil
 }
+
+// Collector is the configuration of the collector service (Botsight.md, 10).
+type Collector struct {
+	Addr             string        // COLLECTOR_ADDR, default :8081
+	DatabaseURL      string        // DATABASE_URL: API keys on cache misses
+	RedisURL         string        // REDIS_URL: dedup, rate limits, key revocations
+	KafkaBrokers     string        // KAFKA_BROKERS, comma-separated
+	KafkaReplication int16         // KAFKA_REPLICATION_FACTOR for created topics, default 1 (3 in production)
+	CreateTopics     bool          // KAFKA_CREATE_TOPICS: create missing topics on start, default true
+	RatePerSecond    float64       // INGEST_RATE: events per second per project, default 2000
+	Burst            float64       // INGEST_BURST: bucket size per project, default 20000
+	MaxInflight      int           // INGEST_MAX_INFLIGHT: concurrent batches per instance, default 512
+	KeyCacheTTL      time.Duration // KEY_CACHE_TTL, default 60s
+	LogLevel         string        // LOG_LEVEL
+}
+
+func LoadCollector() (Collector, error) {
+	c := Collector{
+		Addr:         env("COLLECTOR_ADDR", ":8081"),
+		DatabaseURL:  os.Getenv("DATABASE_URL"),
+		RedisURL:     os.Getenv("REDIS_URL"),
+		KafkaBrokers: os.Getenv("KAFKA_BROKERS"),
+		LogLevel:     env("LOG_LEVEL", "info"),
+	}
+	p := parser{}
+	c.KafkaReplication = int16(p.int("KAFKA_REPLICATION_FACTOR", 1))
+	c.CreateTopics = p.bool("KAFKA_CREATE_TOPICS", true)
+	c.RatePerSecond = p.float("INGEST_RATE", 2000)
+	c.Burst = p.float("INGEST_BURST", 20000)
+	c.MaxInflight = p.int("INGEST_MAX_INFLIGHT", 512)
+	c.KeyCacheTTL = p.duration("KEY_CACHE_TTL", 60*time.Second)
+	if p.err != nil {
+		return c, p.err
+	}
+	switch {
+	case c.DatabaseURL == "":
+		return c, fmt.Errorf("config: DATABASE_URL is required")
+	case c.RedisURL == "":
+		return c, fmt.Errorf("config: REDIS_URL is required")
+	case c.KafkaBrokers == "":
+		return c, fmt.Errorf("config: KAFKA_BROKERS is required")
+	case c.Burst < 500:
+		return c, fmt.Errorf("config: INGEST_BURST must fit a full batch (500 events)")
+	case c.RatePerSecond <= 0:
+		return c, fmt.Errorf("config: INGEST_RATE must be positive")
+	}
+	return c, nil
+}
+
+// CHWriter is the configuration of ch-writer (Botsight.md, 11.2).
+type CHWriter struct {
+	Addr               string        // CHWRITER_ADDR: /healthz, /readyz, /metrics; default :8082
+	RedisURL           string        // REDIS_URL: chunk plans
+	KafkaBrokers       string        // KAFKA_BROKERS
+	KafkaReplication   int16         // KAFKA_REPLICATION_FACTOR
+	CreateTopics       bool          // KAFKA_CREATE_TOPICS
+	Group              string        // CHWRITER_GROUP, default ch-writer
+	ClickHouseAddr     string        // CLICKHOUSE_ADDR host:port of the native protocol
+	ClickHouseDatabase string        // CLICKHOUSE_DATABASE, default botsight
+	ClickHouseUser     string        // CLICKHOUSE_USER, default default
+	ClickHousePassword string        // CLICKHOUSE_PASSWORD
+	BatchRows          int           // CHWRITER_BATCH_ROWS, default 50000
+	FlushInterval      time.Duration // CHWRITER_FLUSH_INTERVAL, default 1s
+	LogLevel           string
+}
+
+func LoadCHWriter() (CHWriter, error) {
+	c := CHWriter{
+		Addr:               env("CHWRITER_ADDR", ":8082"),
+		RedisURL:           os.Getenv("REDIS_URL"),
+		KafkaBrokers:       os.Getenv("KAFKA_BROKERS"),
+		Group:              env("CHWRITER_GROUP", "ch-writer"),
+		ClickHouseAddr:     os.Getenv("CLICKHOUSE_ADDR"),
+		ClickHouseDatabase: env("CLICKHOUSE_DATABASE", "botsight"),
+		ClickHouseUser:     env("CLICKHOUSE_USER", "default"),
+		ClickHousePassword: os.Getenv("CLICKHOUSE_PASSWORD"),
+		LogLevel:           env("LOG_LEVEL", "info"),
+	}
+	p := parser{}
+	c.KafkaReplication = int16(p.int("KAFKA_REPLICATION_FACTOR", 1))
+	c.CreateTopics = p.bool("KAFKA_CREATE_TOPICS", true)
+	c.BatchRows = p.int("CHWRITER_BATCH_ROWS", 50_000)
+	c.FlushInterval = p.duration("CHWRITER_FLUSH_INTERVAL", time.Second)
+	if p.err != nil {
+		return c, p.err
+	}
+	switch {
+	case c.RedisURL == "":
+		return c, fmt.Errorf("config: REDIS_URL is required")
+	case c.KafkaBrokers == "":
+		return c, fmt.Errorf("config: KAFKA_BROKERS is required")
+	case c.ClickHouseAddr == "":
+		return c, fmt.Errorf("config: CLICKHOUSE_ADDR is required")
+	}
+	return c, nil
+}
+
+// parser reads typed variables and keeps the first error.
+type parser struct{ err error }
+
+func (p *parser) fail(key, v string) {
+	if p.err == nil {
+		p.err = fmt.Errorf("config: %s: invalid value %q", key, v)
+	}
+}
+
+func (p *parser) int(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		p.fail(key, v)
+		return def
+	}
+	return n
+}
+
+func (p *parser) float(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		p.fail(key, v)
+		return def
+	}
+	return f
+}
+
+func (p *parser) bool(key string, def bool) bool {
+	b, err := envBool(key, def)
+	if err != nil {
+		p.fail(key, os.Getenv(key))
+	}
+	return b
+}
+
+func (p *parser) duration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		p.fail(key, v)
+		return def
+	}
+	return d
+}
