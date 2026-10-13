@@ -313,7 +313,7 @@ type featureRow struct {
 
 func waitFeatures(t *testing.T, pid uint32, user uint64, updates uint32) featureRow {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	var f featureRow
 	for time.Now().Before(deadline) {
 		err := env.ClickHouse.QueryRow(context.Background(), `SELECT updates, intervals, fast_intervals, signature

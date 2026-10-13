@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/auth"
@@ -209,21 +210,43 @@ func (h *harness) send(batch map[string]any) resp {
 	return h.post(gz(b), nil)
 }
 
-// consume reads every record of the project from a topic until want are seen or the timeout.
-func consume(t *testing.T, topic string, projectID int32, want int) []*kgo.Record {
+// consume returns every record of the project in a topic. It first asks Kafka for the
+// end offset of each partition and reads up to it, so it sees everything already written
+// however slow the broker is, and "nothing written" checks are exact.
+func consume(t *testing.T, topic string, projectID int32) []*kgo.Record {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	cl, err := kgo.NewClient(kgo.SeedBrokers(env.KafkaBrokers...), kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cl.Close()
+	ends, err := kadm.NewClient(cl).ListEndOffsets(ctx, topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := map[int32]int64{} // partition -> end offset still to reach
+	ends.Each(func(o kadm.ListedOffset) {
+		if o.Err != nil {
+			t.Fatalf("end offset of %s/%d: %v", topic, o.Partition, o.Err)
+		}
+		if o.Offset > 0 {
+			remaining[o.Partition] = o.Offset
+		}
+	})
 	pid := []byte(strconv.Itoa(int(projectID)))
 	var out []*kgo.Record
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for ctx.Err() == nil && (want < 0 || len(out) < want) {
-		cl.PollFetches(ctx).EachRecord(func(r *kgo.Record) {
+	for len(remaining) > 0 {
+		fetches := cl.PollFetches(ctx)
+		if ctx.Err() != nil {
+			t.Fatalf("reading %s: %d partitions not read to the end", topic, len(remaining))
+		}
+		fetches.EachRecord(func(r *kgo.Record) {
+			if end, ok := remaining[r.Partition]; ok && r.Offset+1 >= end {
+				delete(remaining, r.Partition)
+			}
 			for _, hd := range r.Headers {
 				if hd.Key == "project_id" && bytes.Equal(hd.Value, pid) {
 					out = append(out, r)
@@ -247,7 +270,7 @@ func TestAcceptBatch(t *testing.T) {
 		t.Fatalf("%d %v", r.status, r.body)
 	}
 
-	events := consume(t, kafka.TopicEvents, h.project.ID, 5)
+	events := consume(t, kafka.TopicEvents, h.project.ID)
 	if len(events) != 5 {
 		t.Fatalf("events in Kafka: %d", len(events))
 	}
@@ -268,17 +291,17 @@ func TestAcceptBatch(t *testing.T) {
 			t.Fatalf("%s key %q, want %q", e.Type, rec.Key, want)
 		}
 	}
-	if texts := consume(t, kafka.TopicTexts, h.project.ID, -1); len(texts) != 0 {
+	if texts := consume(t, kafka.TopicTexts, h.project.ID); len(texts) != 0 {
 		t.Fatalf("texts written for a project without capture_text: %d", len(texts))
 	}
-	batches := consume(t, kafka.TopicBatches, h.project.ID, 1)
+	batches := consume(t, kafka.TopicBatches, h.project.ID)
 	var meta event.BatchMeta
 	if len(batches) != 1 || json.Unmarshal(batches[0].Value, &meta) != nil || meta.Dropped != 3 || meta.Events != 5 || meta.SDKVersion != "0.1.0" {
 		t.Fatalf("batch meta: %+v", meta)
 	}
 
 	// the first event records the project's bot
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		var botID *int64
 		if err := env.Pool.QueryRow(context.Background(), "SELECT bot_id FROM projects WHERE id = $1", h.project.ID).Scan(&botID); err != nil {
@@ -297,12 +320,12 @@ func TestCaptureText(t *testing.T) {
 	if r := h.send(sdkBatch(sdkEvent(map[string]any{"text": "не приходит код"}))); r.status != http.StatusAccepted {
 		t.Fatalf("%d %v", r.status, r.body)
 	}
-	texts := consume(t, kafka.TopicTexts, h.project.ID, 1)
+	texts := consume(t, kafka.TopicTexts, h.project.ID)
 	var txt event.Text
 	if len(texts) != 1 || json.Unmarshal(texts[0].Value, &txt) != nil || txt.Text != "не приходит код" {
 		t.Fatalf("texts: %v", texts)
 	}
-	if bytes.Contains(consume(t, kafka.TopicEvents, h.project.ID, 1)[0].Value, []byte("не приходит")) {
+	if bytes.Contains(consume(t, kafka.TopicEvents, h.project.ID)[0].Value, []byte("не приходит")) {
 		t.Fatal("text leaked into events.raw")
 	}
 }
@@ -317,7 +340,7 @@ func TestDuplicateAndInProgress(t *testing.T) {
 	if r.status != http.StatusAccepted || r.body["duplicate"] != true || r.body["accepted"] != 2.0 {
 		t.Fatalf("retry: %d %v", r.status, r.body)
 	}
-	if n := len(consume(t, kafka.TopicEvents, h.project.ID, -1)); n != 2 {
+	if n := len(consume(t, kafka.TopicEvents, h.project.ID)); n != 2 {
 		t.Fatalf("events after a retry: %d", n)
 	}
 
@@ -374,7 +397,7 @@ func TestAuthentication(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.Redis.Publish(context.Background(), auth.KeyRevocationChannel, prefix)
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if h.send(sdkBatch(sdkEvent(nil))).status == http.StatusUnauthorized {
 			return
