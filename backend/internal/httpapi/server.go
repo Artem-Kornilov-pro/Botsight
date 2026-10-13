@@ -179,6 +179,9 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/topics/{topicID}/examples", s.topicExamples)
 				r.Get("/alerts", s.listAlerts)
 				r.Post("/ask", s.ask)
+
+				r.Get("/antifraud", s.antifraudSummary)
+				r.Get("/antifraud/users", s.antifraudUsers)
 			})
 		})
 	})

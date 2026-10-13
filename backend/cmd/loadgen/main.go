@@ -41,6 +41,7 @@ type options struct {
 	batch       int
 	duplicates  float64
 	texts       bool
+	fraud       float64
 	journal     string
 }
 
@@ -57,6 +58,7 @@ func main() {
 	flag.IntVar(&o.batch, "batch", 500, "events per batch (max 500)")
 	flag.Float64Var(&o.duplicates, "duplicates", 0, "fraction of batches sent twice (checks deduplication)")
 	flag.BoolVar(&o.texts, "texts", false, "enable capture_text and send message texts on several topics (for the AI module)")
+	flag.Float64Var(&o.fraud, "fraud", 0, "share of users that are bot farms: scripted promo_farm accounts and a referral farm (for antifraud)")
 	flag.StringVar(&o.journal, "journal", "", "file to write accepted event_ids to, for reconciliation")
 	flag.Parse()
 
@@ -116,12 +118,12 @@ func run(o options) error {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
-			gen := newGenerator(worker, o.users)
-			gen.texts = o.texts
+			gen := newGenerator(worker, o.concurrency, o.users)
+			gen.texts, gen.fraud = o.texts, o.fraud
 			next := time.Now()
 			for n := worker; runCtx.Err() == nil; n += o.concurrency {
 				p := projects[n%len(projects)]
-				events, body := gen.batch(o.batch)
+				events, body := gen.batch(n%len(projects), o.batch)
 				// In-flight batches finish after the deadline (ctx, not runCtx), so the
 				// journal matches what the collector accepted.
 				record := func(accepted bool) {
@@ -234,12 +236,36 @@ func apiCallMethod(ctx context.Context, c *http.Client, method, csrf, url string
 // generator produces batches like the Python SDK: a user walks a /start -> form ->
 // purchase scenario; every action yields an update, a step and an outgoing request.
 type generator struct {
-	rnd   *mrand.Rand
-	users int
-	state map[int]int
-	buf   bytes.Buffer
-	texts bool // add message texts for the AI module
+	rnd    *mrand.Rand
+	worker int // users are split between senders, so one user's timeline stays consistent
+	stride int
+	n      int                 // users of this sender
+	users  map[[2]int]*simUser // per project and user: each bot has its own timeline
+	buf    bytes.Buffer
+	texts  bool    // add message texts for the AI module
+	fraud  float64 // share of farm accounts
 }
+
+// simUser is one simulated Telegram user with its own clock: event times follow how
+// fast a person or a script acts, not how fast loadgen sends.
+type simUser struct {
+	id       int64
+	kind     int // userPerson, userFarm, userRefFarm
+	source   string
+	lang     string
+	username bool
+	premium  bool
+	scripted bool // acts with fixed short pauses
+	clock    time.Time
+	step     int
+}
+
+const (
+	userPerson = iota
+	userFarm
+	userRefFarm
+	refFarmRoot = 9_500_000_000 // the account that "invites" the referral farm
+)
 
 // phrases are user messages on a few support topics plus small talk, for -texts.
 var phrases = [][]string{
@@ -262,36 +288,77 @@ var (
 	sources = []string{"ch_tech", "ch_memes", "vk_ads_oct", ""}
 )
 
-func newGenerator(seed, users int) *generator {
-	return &generator{rnd: mrand.New(mrand.NewPCG(uint64(seed), uint64(time.Now().UnixNano()))), users: users, state: map[int]int{}}
+func newGenerator(worker, stride, users int) *generator {
+	return &generator{
+		rnd:    mrand.New(mrand.NewPCG(uint64(worker), uint64(time.Now().UnixNano()))),
+		worker: worker, stride: stride, n: max(1, users/stride), users: map[[2]int]*simUser{},
+	}
 }
 
-func (g *generator) batch(n int) (ids []string, body []byte) {
+func (g *generator) user(project int, now time.Time) *simUser {
+	idx := g.rnd.IntN(g.n)*g.stride + g.worker
+	if u := g.users[[2]int{project, idx}]; u != nil {
+		return u
+	}
+	u := &simUser{clock: now.Add(-15*time.Minute + time.Duration(g.rnd.IntN(600))*time.Second)}
+	// a stable pseudo-random share of users are farm accounts
+	if float64(uint64(idx)*2654435761%1000)/1000 < g.fraud {
+		u.kind, u.lang, u.scripted = userFarm, "en", true
+		u.id, u.source = 9_000_000_000+int64(idx), "promo_farm"
+		if idx%2 == 1 { // the referral farm: half scripted, half driven by hand
+			u.kind, u.id, u.source = userRefFarm, refFarmRoot+1+int64(idx), fmt.Sprintf("ref_%d", refFarmRoot)
+			u.scripted = (idx/2)%2 == 0
+		}
+	} else {
+		u.kind, u.id = userPerson, 100_000_000+int64(idx)*7919 // older accounts: smaller ids
+		u.source = sources[g.rnd.IntN(len(sources))]
+		u.lang = []string{"ru", "ru", "ru", "ru", "en", "uk"}[g.rnd.IntN(6)]
+		u.username, u.premium = g.rnd.IntN(100) < 85, g.rnd.IntN(100) < 5
+	}
+	g.users[[2]int{project, idx}] = u
+	return u
+}
+
+// pause between two actions: people read and type, scripts sleep a fixed time.
+func (g *generator) pause(u *simUser) time.Duration {
+	if u.scripted {
+		return time.Duration(120+g.rnd.IntN(60)) * time.Millisecond
+	}
+	return time.Duration(1200+g.rnd.ExpFloat64()*6000) * time.Millisecond
+}
+
+func (g *generator) batch(project, n int) (ids []string, body []byte) {
 	now := time.Now().UTC()
 	ts := now.Format("2006-01-02T15:04:05.000Z")
 	events := make([]map[string]any, 0, n)
 	for len(events) < n {
-		user := g.rnd.IntN(g.users) + 1
-		step := g.state[user]
+		u := g.user(project, now)
+		user := u.id
+		step := u.step
 		next := step + 1
 		if next >= len(states) || g.rnd.IntN(10) == 0 {
 			next = 0 // finished or dropped off: start again
 		}
-		g.state[user] = next
+		u.step = next
+		u.clock = u.clock.Add(g.pause(u))
+		if u.clock.After(now.Add(time.Minute)) {
+			u.clock = now // never far in the future
+		}
+		at := u.clock.UTC().Format("2006-01-02T15:04:05.000Z")
 		base := func(typ, name string) map[string]any {
-			return map[string]any{"event_id": uuid7(now), "type": typ, "name": name, "ts": ts,
+			return map[string]any{"event_id": uuid7(u.clock), "type": typ, "name": name, "ts": at,
 				"bot_id": 7000000001, "user_id": user, "chat_id": user}
 		}
 		update := base("update", "message")
 		update["chat_type"], update["content_type"], update["text_len"] = "private", "text", 5+g.rnd.IntN(40)
 		update["state"], update["handled"], update["duration_ms"] = states[step], true, g.rnd.IntN(50)
-		update["user"] = map[string]any{"lang": "ru", "is_premium": g.rnd.IntN(20) == 0, "has_username": true}
+		update["user"] = map[string]any{"lang": u.lang, "is_premium": u.premium, "has_username": u.username}
 		if g.texts && step > 0 {
 			text := g.text()
 			update["text"], update["text_len"] = text, len([]rune(text))
 		}
 		if step == 0 {
-			update["command"], update["start_param"] = "start", sources[g.rnd.IntN(len(sources))]
+			update["command"], update["start_param"] = "start", u.source
 		}
 		stepEv := base("step", "message")
 		stepEv["handler"], stepEv["state_from"], stepEv["state_to"] = "bot.handlers:step", states[step], states[next]
