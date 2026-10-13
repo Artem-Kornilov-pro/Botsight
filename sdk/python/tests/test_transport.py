@@ -21,7 +21,8 @@ from .conftest import API_KEY, BOT_ID, Collector, make_bot, message_update
 
 TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
 UUID7_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
-FIXTURE = Path(__file__).parent / "fixtures" / "batch_v1.json"
+# Shared with the collector tests, section 9.5 of Botsight.md
+FIXTURE = Path(__file__).resolve().parents[3] / "docs" / "contract" / "batch_v1.json"
 
 
 class Form(StatesGroup):
