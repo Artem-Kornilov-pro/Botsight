@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "batch_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d80",
+  "sent_at": "2026-10-13T00:12:47.002Z",
+  "sdk": {
+    "name": "botsight-python",
+    "version": "0.1.0",
+    "framework": "aiogram",
+    "framework_version": "3.31.0"
+  },
+  "dropped": 0,
+  "events": [
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d70",
+      "type": "lifecycle",
+      "name": "bot_started",
+      "ts": "2026-10-13T00:12:40.000Z",
+      "bot_id": 7012345678,
+      "user_id": 0,
+      "chat_id": 0,
+      "props": {
+        "sdk_version": "0.1.0",
+        "framework": "aiogram",
+        "framework_version": "3.31.0",
+        "python_version": "3.12.7"
+      }
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d81",
+      "type": "update",
+      "name": "message",
+      "ts": "2026-10-13T00:12:45.123Z",
+      "bot_id": 7012345678,
+      "user_id": 123456789,
+      "chat_id": 123456789,
+      "chat_type": "private",
+      "state": "",
+      "text_len": 17,
+      "content_type": "text",
+      "command": "start",
+      "start_param": "vk_ads_oct",
+      "user": { "lang": "ru", "is_premium": false, "has_username": true },
+      "handled": true,
+      "duration_ms": 41
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d85",
+      "type": "update",
+      "name": "callback_query",
+      "ts": "2026-10-13T00:12:51.880Z",
+      "bot_id": 7012345678,
+      "user_id": 123456789,
+      "chat_id": 123456789,
+      "chat_type": "private",
+      "state": "Form:lab",
+      "text_len": 0,
+      "callback_data": "lab:lab2",
+      "user": { "lang": "ru", "is_premium": false, "has_username": true },
+      "handled": true,
+      "duration_ms": 14
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d82",
+      "type": "step",
+      "name": "callback_query",
+      "ts": "2026-10-13T00:12:51.900Z",
+      "bot_id": 7012345678,
+      "user_id": 123456789,
+      "chat_id": 123456789,
+      "handler": "bot.handlers:cb_lab",
+      "state_from": "Form:lab",
+      "state_to": "Form:name",
+      "duration_ms": 12,
+      "error": null
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d86",
+      "type": "step",
+      "name": "message",
+      "ts": "2026-10-13T00:12:52.100Z",
+      "bot_id": 7012345678,
+      "user_id": 123456789,
+      "chat_id": 123456789,
+      "handler": "bot.handlers:got_name",
+      "state_from": "Form:name",
+      "state_to": "Form:group",
+      "duration_ms": 3,
+      "error": null
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d83",
+      "type": "outgoing",
+      "name": "sendDocument",
+      "ts": "2026-10-13T00:13:05.410Z",
+      "bot_id": 7012345678,
+      "user_id": 0,
+      "chat_id": 123456789,
+      "ok": false,
+      "error_code": 403,
+      "error": "bot_blocked",
+      "duration_ms": 87
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d87",
+      "type": "outgoing",
+      "name": "sendMessage",
+      "ts": "2026-10-13T00:13:05.500Z",
+      "bot_id": 7012345678,
+      "user_id": 0,
+      "chat_id": 123456789,
+      "ok": true,
+      "error_code": 0,
+      "error": null,
+      "duration_ms": 52
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d88",
+      "type": "update",
+      "name": "my_chat_member",
+      "ts": "2026-10-13T00:13:06.000Z",
+      "bot_id": 7012345678,
+      "user_id": 123456789,
+      "chat_id": 123456789,
+      "chat_type": "private",
+      "state": "",
+      "text_len": 0,
+      "member_status": "kicked",
+      "user": { "lang": "ru", "is_premium": false, "has_username": true },
+      "handled": true,
+      "duration_ms": 1
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d84",
+      "type": "custom",
+      "name": "purchase",
+      "ts": "2026-10-13T00:13:04.950Z",
+      "bot_id": 7012345678,
+      "user_id": 123456789,
+      "chat_id": 0,
+      "props": { "amount": 990, "plan": "pro" }
+    },
+    {
+      "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d89",
+      "type": "lifecycle",
+      "name": "bot_stopped",
+      "ts": "2026-10-13T00:20:00.000Z",
+      "bot_id": 7012345678,
+      "user_id": 0,
+      "chat_id": 0,
+      "props": {
+        "sdk_version": "0.1.0",
+        "framework": "aiogram",
+        "framework_version": "3.31.0",
+        "python_version": "3.12.7"
+      }
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+name: sdk-python
+
+on:
+  push:
+    branches: [main]
+    paths: ["sdk/python/**", ".github/workflows/sdk-python.yml"]
+  pull_request:
+    paths: ["sdk/python/**", ".github/workflows/sdk-python.yml"]
+
+defaults:
+  run:
+    working-directory: sdk/python
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+
+  test:
+    name: test (python ${{ matrix.python }}, aiogram ${{ matrix.aiogram }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        aiogram: ["latest"]
+        include:
+          # lowest supported versions
+          - python: "3.10"
+            aiogram: "3.10.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - if: matrix.aiogram != 'latest'
+        run: pip install "aiogram==${{ matrix.aiogram }}"
+      - run: pytest
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev]"
+      - run: pytest -m benchmark -s
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build
+      - run: python -m build
