@@ -1,0 +1,1452 @@
+# Botsight
+
+> Аналитика Telegram-ботов в две строки кода.
+
+| | |
+|---|---|
+| Статус | Концепция и техническое описание, версия 0.1 |
+| Дата | 13.10.2026 |
+| Команда | 2 человека, университетский курс по Go |
+| Стек | Go, Python (SDK, AI), Kafka, ClickHouse, PostgreSQL, Redis, React |
+
+Документ для команды, преподавателя курса и акселератора. Разделы 1–6 описывают продукт, разделы 7–22 — техническую реализацию, разделы 23–28 — организацию работы и коммерциализацию.
+
+## Содержание
+
+1. [Коротко](#1-коротко)
+2. [Проблема](#2-проблема)
+3. [Решение](#3-решение)
+4. [Сценарии использования](#4-сценарии-использования)
+5. [Пример подключения: labbot](#5-пример-подключения-labbot)
+6. [Принципы продукта](#6-принципы-продукта)
+7. [Архитектура](#7-архитектура)
+8. [SDK для ботов](#8-sdk-для-ботов)
+9. [Формат событий](#9-формат-событий)
+10. [Приём событий: collector](#10-приём-событий-collector)
+11. [Конвейер данных: Kafka и ClickHouse](#11-конвейер-данных-kafka-и-clickhouse)
+12. [Хранилища и схемы](#12-хранилища-и-схемы)
+13. [Аналитика и запросы](#13-аналитика-и-запросы)
+14. [AI-модуль](#14-ai-модуль)
+15. [Антифрод](#15-антифрод)
+16. [Дашборд на React](#16-дашборд-на-react)
+17. [Наблюдаемость и SLO](#17-наблюдаемость-и-slo)
+18. [Нагрузка, надёжность, тестирование](#18-нагрузка-надёжность-тестирование)
+19. [Безопасность и персональные данные](#19-безопасность-и-персональные-данные)
+20. [Режим прокси Bot API](#20-режим-прокси-bot-api)
+21. [Ключевые архитектурные решения](#21-ключевые-архитектурные-решения)
+22. [Модули повышенной сложности](#22-модули-повышенной-сложности)
+23. [Технологический стек](#23-технологический-стек)
+24. [Структура репозитория](#24-структура-репозитория)
+25. [Распределение работы](#25-распределение-работы)
+26. [Дорожная карта](#26-дорожная-карта)
+27. [Монетизация и коммерциализация](#27-монетизация-и-коммерциализация)
+28. [Риски и открытые вопросы](#28-риски-и-открытые-вопросы)
+29. [Глоссарий](#29-глоссарий)
+
+---
+
+## 1. Коротко
+
+**Botsight** — облачный сервис аналитики для Telegram-ботов. Владелец бота устанавливает Python-пакет `botsight`, добавляет две строки в код запуска бота и получает дашборд:
+
+- откуда приходят пользователи и какой рекламный канал окупается;
+- на каком шаге сценария пользователи бросают бота;
+- кто и когда блокирует бота;
+- какие ошибки возникают в хендлерах и в запросах к Telegram;
+- о чём пользователи пишут боту (AI-кластеризация сообщений);
+- какая часть трафика — ботофермы.
+
+Остальной код бота (хендлеры, клавиатуры, сценарии) не меняется.
+
+Для команды это проект уровня production: приём большого потока событий на Go, Kafka, ClickHouse, гарантии доставки, нагрузочные и хаос-тесты, React-дашборд и AI-модуль. Для рынка — B2B-продукт с понятной моделью подписки.
+
+## 2. Проблема
+
+Telegram-бот для владельца — чёрный ящик.
+
+1. **Нет воронки.** Владелец видит, сколько людей нажали `/start` (если сам это считает), но не видит, на каком шаге анкеты, каталога или оплаты они уходят.
+2. **Непонятно, куда уходят рекламные деньги.** Реклама покупается в десятках каналов, у каждого своя ссылка `t.me/bot?start=метка`, но связать метку с оплатами вручную сложно.
+3. **Ошибки узнают от пользователей.** Исключение в хендлере, недоставленные сообщения, блокировки бота — всё это остаётся в логах, которые никто не читает.
+4. **Свободные сообщения никто не анализирует.** В боте поддержки тысячи сообщений в день, но тренды («на этой неделе втрое больше жалоб на код подтверждения») никто не видит.
+5. **Своя аналитика дорогая.** Каждый раз писать таблицу событий, агрегаты и графики невыгодно, а веб-аналитика не понимает сущностей бота: апдейтов, команд, callback-кнопок, состояний FSM.
+
+## 3. Решение
+
+Подключение — две строки после регистрации роутеров:
+
+```python
+from botsight import setup
+
+dp.include_router(router)                       # уже есть в боте
+setup(dp, bot, api_key="bs_live_...")           # +1 строка
+await dp.start_polling(bot)                     # уже есть в боте
+```
+
+Что владелец получает **без изменений в хендлерах**:
+
+| Данные | Откуда берутся |
+|---|---|
+| Пользователи, DAU/WAU/MAU, новые и вернувшиеся | все входящие апдейты |
+| Источники трафика | параметр `/start <метка>` (deep link) |
+| Воронки и граф сценария | переходы состояний FSM до и после каждого хендлера |
+| «Пользователь застрял на шаге» | хендлер отработал, а состояние FSM не изменилось |
+| «Бот не понял пользователя» | апдейт, который не обработал ни один хендлер, или срабатывание запасного хендлера |
+| Блокировки и отток | ошибка 403 при отправке, апдейт `my_chat_member` |
+| Ошибки и медленные хендлеры | исключения и время обработки каждого хендлера |
+| Ошибки Bot API и упирания в лимиты | ответы Telegram на исходящие запросы (400, 403, 429) |
+| Отметки деплоев | события запуска и остановки бота |
+
+Что добавляется **по желанию** одной строкой в нужном месте — бизнес-события, которые знает только бот: оплата, оформленный заказ, сгенерированный документ:
+
+```python
+botsight.track("purchase", user_id=user.id, props={"amount": 990, "plan": "pro"})
+```
+
+Так же устроена веб-аналитика: просмотры страниц собираются сами, а покупки размечаются вручную.
+
+## 4. Сценарии использования
+
+### 4.1. Атрибуция рекламы
+
+Владелец покупает рекламу в 10 каналах и даёт каждому свою ссылку: `t.me/shop_bot?start=ch_tech`, `t.me/shop_bot?start=ch_memes`. Botsight показывает для каждой метки: сколько пользователей пришло, сколько дошло до оплаты, какова конверсия. Если владелец вводит расходы на канал, Botsight считает стоимость привлечения одного платящего пользователя.
+
+### 4.2. Воронка бота-магазина или бота записи
+
+Сценарий `/start → каталог → корзина → оплата` или `/start → услуга → дата → время → подтверждение`. Botsight строит воронку из состояний FSM автоматически и показывает, на каком шаге уходит больше всего людей. После изменения сценария видно, стало ли лучше.
+
+### 4.3. Бот поддержки
+
+Тысячи свободных сообщений в день. AI-модуль группирует их в темы, называет темы человеческим языком и предупреждает о всплесках: «тема "не приходит код" выросла в 3 раза за неделю». Отдельно видна доля сообщений, которые бот не смог обработать.
+
+### 4.4. Mini Apps и игры с наградами
+
+DAU, удержание по когортам, реферальные цепочки и антифрод: какая доля «пользователей» из каждого источника похожа на ботоферму.
+
+## 5. Пример подключения: labbot
+
+[labbot](https://github.com/Artem-Kornilov-pro/labbot) — бот на aiogram 3, который собирает лабораторные работы по варианту. Сценарий — анкета на FSM:
+
+```
+Создать лабу → выбор лабы → ФИО → группа → преподаватель → вариант → подтверждение → генерация → файлы
+```
+
+### 5.1. Изменения в коде
+
+`requirements.txt`: добавить `botsight`. В `bot/__main__.py`:
+
+```python
+from botsight import setup                                          # +1
+
+    dp.include_router(router)
+    setup(dp, bot, api_key=os.environ["BOTSIGHT_KEY"],              # +1
+          skip_text_in_states={"Form:name"})                         # опционально: не трогать ввод ФИО
+```
+
+Хендлеры в `bot/handlers.py` не меняются.
+
+### 5.2. Воронка, которая строится автоматически
+
+| Шаг воронки | Событие в Botsight |
+|---|---|
+| Начал анкету | переход в `Form:lab` (кнопка «Создать лабу» или `/new`) |
+| Выбрал лабу | переход в `Form:name` (хендлер `cb_lab`) |
+| Ввёл ФИО | переход в `Form:group` |
+| Указал или пропустил группу | переход в `Form:teacher` |
+| Указал или пропустил преподавателя | переход в `Form:variant` |
+| Ввёл вариант | переход в `Form:confirm` |
+| Получил лабу | переход из `Form:confirm` и отправка документов (`sendDocument`) |
+
+### 5.3. Что увидит автор labbot
+
+- **Где застревают.** Регулярное выражение `NAME_WORD` отвергает ввод вида «Иванов И.И.» из-за точек. Если на шаге ФИО много повторных вводов (состояние не меняется), причина почти наверняка в этом.
+- **Спрос на платный тариф.** Сколько пользователей упёрлись в лимит `LAB_LIMIT=2`. Это ручное событие `limit_reached` одной строкой.
+- **Очередь генерации.** Генерация ограничена семафором `GEN_LIMIT = asyncio.Semaphore(4)`. Ручное событие `lab_generated` с полями `queue_ms` и `gen_ms` покажет, когда перед дедлайнами растёт очередь и пора масштабироваться.
+- **Что просят.** Тексты, попавшие в хендлер `fallback`, AI-модуль сгруппирует в темы: например, какую лабу просят добавить.
+- **Отток.** Блокировки бота после последней доступной лабы.
+
+### 5.4. Приватность на этом примере
+
+Бот собирает ФИО, группу и преподавателя — это персональные данные. По умолчанию SDK **не отправляет тексты сообщений**: только тип, длину, команду и `callback_data`. Если владелец включит сбор текстов для AI-анализа, параметр `skip_text_in_states={"Form:name"}` исключит ввод ФИО. Содержимое отправленных файлов (.docx с ФИО) не передаётся никогда: SDK видит только имя метода `sendDocument`, чат и результат.
+
+## 6. Принципы продукта
+
+1. **Две строки — и всё работает.** Подключение не требует переписывать бот. Ручные события — опциональное улучшение.
+2. **Бот клиента важнее аналитики.** SDK никогда не бросает исключения в код бота, не задерживает обработку апдейтов и ограничен по памяти. Если Botsight недоступен, теряются события, а не работоспособность бота.
+3. **Токен бота не покидает инфраструктуру клиента.** SDK работает внутри процесса бота и отправляет только события.
+4. **Приватность по умолчанию.** Тексты не собираются, пока владелец явно не включит сбор. Тексты хранятся отдельно и с коротким сроком.
+5. **Изоляция клиентов.** `project_id` определяется по ключу API на сервере и присутствует в каждом запросе к хранилищам. Тело запроса не может указать чужой проект.
+6. **Измеримость.** У каждого сервиса есть метрики, у системы — SLO. Утверждения о производительности подтверждаются бенчмарками и отчётами нагрузочных тестов.
+
+## 7. Архитектура
+
+### 7.1. Общая схема
+
+```mermaid
+flowchart LR
+    subgraph Client["Инфраструктура клиента"]
+        Bot["Бот на aiogram<br/>+ SDK botsight"]
+    end
+    TG["Telegram Bot API"] <--> Bot
+    Bot -- "батчи событий, HTTPS + gzip" --> LB["Балансировщик"]
+    LB --> COL["collector (Go)"]
+    COL <--> R[("Redis")]
+    COL --> K1[["Kafka: events.raw"]]
+    COL --> K2[["Kafka: messages.text"]]
+    K1 --> W["ch-writer (Go)"]
+    K2 --> W
+    K1 --> AF["antifraud (Go)"]
+    K2 --> AI["ai-worker (Python)"]
+    W --> CH[("ClickHouse")]
+    AF --> CH
+    AI --> Q[("Qdrant")]
+    AI --> CH
+    API["api (Go)"] --> CH
+    API <--> PG[("PostgreSQL")]
+    API <--> R
+    WEB["Дашборд (React)"] --> API
+```
+
+### 7.2. Компоненты
+
+| Компонент | Язык | Ответственность | Масштабирование |
+|---|---|---|---|
+| SDK `botsight` | Python | сбор событий в процессе бота, батчи, ретраи | живёт в каждом боте |
+| `collector` | Go | приём батчей, аутентификация, валидация, лимиты, запись в Kafka | без состояния, горизонтально |
+| Kafka | — | буфер и шина событий | партиции |
+| `ch-writer` | Go | Kafka → ClickHouse пачками, дедупликация, DLQ | по числу партиций |
+| `antifraud` | Go | стриминговые признаки, скоринг подозрительных пользователей | по числу партиций |
+| `ai-worker` | Python | эмбеддинги, кластеризация тем, NL→SQL, объяснение аномалий | очередь задач |
+| ClickHouse | — | события и агрегаты | шарды и реплики |
+| PostgreSQL | — | аккаунты, проекты, ключи, настройки | реплика для чтения |
+| Redis | — | лимиты, дедупликация батчей, кэш запросов, сессии | один инстанс, позже кластер |
+| `api` | Go | REST для дашборда, auth, построитель аналитических запросов | без состояния, горизонтально |
+| Дашборд | TypeScript, React | интерфейс клиента | статика на CDN |
+| Prometheus, Grafana | — | мониторинг самой системы | — |
+
+**Data plane** (путь событий): SDK → collector → Kafka → ch-writer → ClickHouse. Должен выдерживать нагрузку и не терять данные.
+**Control plane** (управление): api, PostgreSQL, дашборд. Должен быть удобным и безопасным.
+
+### 7.3. Путь одного события
+
+1. Пользователь нажимает кнопку в боте. aiogram получает апдейт.
+2. Middleware SDK формирует событие и кладёт его в очередь в памяти (`put_nowait`, без ожидания).
+3. Фоновая задача SDK собирает батч (до 500 событий или 2 секунды), сжимает gzip и отправляет `POST /v1/batch`.
+4. `collector` проверяет ключ, лимит и дубликат батча, валидирует события и пишет их в Kafka с подтверждением от всех реплик.
+5. Только после подтверждения Kafka `collector` отвечает `202 Accepted`.
+6. `ch-writer` читает партицию, копит пачку и вставляет её в ClickHouse одним INSERT. Смещение в Kafka фиксируется после успешной вставки.
+7. Материализованные представления ClickHouse обновляют дневные агрегаты.
+8. Дашборд запрашивает данные через `api`. Цель по свежести: событие видно в дашборде через 10 секунд (p95).
+
+## 8. SDK для ботов
+
+Первая версия поддерживает aiogram 3. Формат событий не зависит от фреймворка, поэтому SDK для python-telegram-bot, grammY (Node.js) и telebot (Go) добавляются без изменений на сервере.
+
+### 8.1. Установка и подключение
+
+```bash
+pip install botsight
+```
+
+```python
+from botsight import setup
+
+dp.include_router(router)
+setup(dp, bot, api_key=os.environ["BOTSIGHT_KEY"])
+```
+
+`setup()` нужно вызывать **после** `include_router(...)`. Причина: при `track_blocks=True` SDK добавляет собственный роутер для апдейтов `my_chat_member`, и этот роутер должен быть последним, чтобы не перехватывать хендлеры бота (aiogram проверяет хендлеры роутеров в порядке подключения). Кроме того, aiogram по умолчанию запрашивает у Telegram только те типы апдейтов, для которых есть хендлеры (`resolve_used_update_types()`), и делает это до вызова startup-хуков. Поэтому роутер должен быть подключён до `start_polling`.
+
+### 8.2. Что делает `setup()`
+
+```python
+def setup(dp: Dispatcher, bot: Bot, api_key: str, **options) -> Botsight:
+    client = Botsight(api_key, **options)
+
+    dp.update.outer_middleware(UpdateMiddleware(client))     # 1. все входящие апдейты
+    steps = StepMiddleware(client)
+    dp.message.middleware(steps)                              # 2. шаги FSM и хендлеры
+    dp.callback_query.middleware(steps)
+    bot.session.middleware(OutgoingMiddleware(client))        # 3. исходящие запросы к Bot API
+
+    if client.options.track_blocks:
+        dp.include_router(_blocks_router())                   # подписка на my_chat_member
+
+    dp.startup.register(client.start)                         # запуск фоновой отправки
+    dp.shutdown.register(client.close)                        # дослать события при остановке
+    dp["botsight"] = client                                   # доступ из хендлеров для track()
+    return client
+```
+
+Inner-middleware, зарегистрированные на диспетчере, aiogram применяет и к хендлерам во вложенных роутерах (`TelegramEventObserver._resolve_middlewares` проходит по цепочке роутеров от корня), поэтому регистрации на `dp` достаточно.
+
+### 8.3. Хук 1: входящие апдейты
+
+Outer-middleware на `dp.update` видит каждый апдейт до фильтров. К моменту его вызова встроенные middleware aiogram уже положили в `data` пользователя (`event_from_user`), чат (`event_chat`) и текущее состояние FSM (`raw_state`).
+
+```python
+class UpdateMiddleware(BaseMiddleware):
+    def __init__(self, client: Botsight):
+        self.client = client
+
+    async def __call__(self, handler, update: Update, data: dict):
+        t0 = time.monotonic()
+        result = UNHANDLED
+        failed = False
+        try:
+            result = await handler(update, data)
+            return result
+        except Exception:
+            failed = True                                 # хендлер нашёлся, но упал
+            raise
+        finally:
+            self.client.emit_update(
+                update,
+                user=data.get("event_from_user"),
+                chat=data.get("event_chat"),
+                state=data.get("raw_state"),
+                handled=failed or result is not UNHANDLED,  # False — не подошёл ни один хендлер
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
+```
+
+Из апдейта извлекаются: тип (`update.event_type`), тип содержимого (`message.content_type`), команда и параметр deep link для `/start` (до 64 символов), `callback_data`, длина текста, язык и премиум-статус пользователя, наличие username. Текст — только при `capture_text=True` и только если текущее состояние не входит в `skip_text_in_states`.
+
+### 8.4. Хук 2: шаги FSM и хендлеры
+
+Inner-middleware на `message` и `callback_query` вызывается после фильтров, поэтому знает, какой хендлер сработал (`data["handler"]`).
+
+```python
+class StepMiddleware(BaseMiddleware):
+    def __init__(self, client: Botsight):
+        self.client = client
+
+    async def __call__(self, handler, event, data: dict):
+        state: FSMContext | None = data.get("state")
+        before = data.get("raw_state")                    # уже прочитано aiogram, бесплатно
+        t0 = time.monotonic()
+        error = None
+        try:
+            return await handler(event, data)
+        except Exception as exc:
+            error = type(exc).__name__
+            raise                                         # исключение бота не глотаем
+        finally:
+            after = await state.get_state() if state else None
+            cb = data["handler"].callback
+            self.client.emit_step(
+                user=data.get("event_from_user"),
+                chat=data.get("event_chat"),
+                handler=f"{cb.__module__}:{cb.__qualname__}",
+                state_from=before,
+                state_to=after,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                error=error,
+            )
+```
+
+Стоимость: одно дополнительное чтение состояния после хендлера. С `MemoryStorage` это обращение к словарю, с `RedisStorage` — один запрос к Redis на апдейт. Отключается параметром `track_fsm=False`.
+
+### 8.5. Хук 3: исходящие запросы
+
+Request-middleware сессии aiogram оборачивает каждый вызов Bot API. Ответ Telegram с ошибкой aiogram превращает в исключение (`TelegramForbiddenError`, `TelegramRetryAfter` и т. д.), которое проходит через middleware.
+
+```python
+class OutgoingMiddleware(BaseRequestMiddleware):
+    def __init__(self, client: Botsight):
+        self.client = client
+
+    async def __call__(self, make_request, bot, method):
+        if isinstance(method, GetUpdates):                # long polling не интересен
+            return await make_request(bot, method)
+        t0 = time.monotonic()
+        try:
+            response = await make_request(bot, method)
+        except TelegramAPIError as exc:
+            self.client.emit_outgoing(method, error=exc,
+                                      duration_ms=int((time.monotonic() - t0) * 1000))
+            raise
+        self.client.emit_outgoing(method, duration_ms=int((time.monotonic() - t0) * 1000))
+        return response
+```
+
+Извлекаются: имя метода (`method.__api_method__`: `sendMessage`, `sendDocument`, `editMessageText`), `chat_id`, длительность, код и нормализованный тип ошибки. Содержимое сообщений и файлов не читается.
+
+Нормализация ошибок:
+
+| Исключение / описание Telegram | Код | `error` |
+|---|---|---|
+| `TelegramForbiddenError`, «bot was blocked by the user» | 403 | `bot_blocked` |
+| `TelegramForbiddenError`, «user is deactivated» | 403 | `user_deactivated` |
+| `TelegramRetryAfter` | 429 | `rate_limited` |
+| `TelegramBadRequest`, «message is not modified» | 400 | `not_modified` |
+| `TelegramBadRequest`, прочее | 400 | `bad_request` |
+| `TelegramServerError` | 5xx | `server_error` |
+| `TelegramNetworkError` | 0 | `network` |
+
+### 8.6. Обнаружение блокировок
+
+Два независимых источника:
+
+1. **Ошибка 403 `bot_blocked`** при отправке сообщения. Работает всегда, но только когда бот пытается написать пользователю.
+2. **Апдейт `my_chat_member`** со статусом `kicked` в личном чате. Telegram присылает его сразу при блокировке, но только если бот подписан на этот тип апдейтов. При `track_blocks=True` SDK подключает роутер с пустым хендлером `my_chat_member`, и aiogram добавляет этот тип в `allowed_updates`. Если бот уже обрабатывает `my_chat_member` сам, его хендлер срабатывает первым, а роутер SDK, подключённый последним, не мешает.
+
+Для ботов на вебхуках `allowed_updates` задаёт владелец в `set_webhook`. В документации SDK для них будет отдельная инструкция.
+
+### 8.7. Ручные события
+
+```python
+@router.callback_query(Form.confirm, F.data == "gen")
+async def cb_generate(cb: CallbackQuery, state: FSMContext, botsight: Botsight):
+    ...
+    t0 = time.monotonic()
+    async with GEN_LIMIT:
+        t1 = time.monotonic()
+        files = await asyncio.to_thread(lab.generate, ...)
+    botsight.track("lab_generated", user_id=cb.from_user.id, props={
+        "lab": data["lab"],
+        "queue_ms": int((t1 - t0) * 1000),
+        "gen_ms": int((time.monotonic() - t1) * 1000),
+    })
+```
+
+Клиент попадает в хендлер через встроенное внедрение зависимостей aiogram (`dp["botsight"] = client`), так же как в labbot передаются `quota` и `admins`.
+
+Правила для ручных событий: имя в `snake_case` до 64 символов, не больше 32 свойств, строки до 1024 символов. Числа и строки хранятся в разных колонках, чтобы по числам можно было считать суммы и перцентили.
+
+### 8.8. Доставка событий
+
+| Механизм | Реализация |
+|---|---|
+| Очередь | `asyncio.Queue(maxsize=10_000)`. События кладутся через `put_nowait`. При переполнении событие выбрасывается, растёт счётчик `dropped`, который уходит в следующем батче и виден в дашборде. |
+| Батчи | Фоновая задача собирает до 500 событий или ждёт 2 секунды, сериализует в JSON и сжимает gzip. HTTP-клиент — `aiohttp`, он уже установлен вместе с aiogram, новых зависимостей нет. |
+| Идентификаторы | `event_id` и `batch_id` — UUIDv7 (упорядочены по времени), генерируются в SDK. В Python 3.14+ используется `uuid.uuid7()`, для более старых версий — своя реализация на 10 строк. |
+| Неизменяемость батча | При повторной отправке уходит тот же `batch_id` с теми же событиями. На этом держится дедупликация на сервере. |
+| Ретраи | Экспоненциальная задержка с полным джиттером от 0,5 до 60 секунд, не дольше 10 минут на батч. Для 429 учитывается заголовок `Retry-After`. |
+| Circuit breaker | После 5 неудачных отправок подряд SDK делает паузу. Очередь продолжает заполняться до лимита. |
+| Остановка | На `dp.shutdown` SDK досылает очередь с таймаутом 5 секунд. |
+| Изоляция ошибок | Все хуки обёрнуты в `try/except`. Ошибки самого SDK пишутся в лог не чаще раза в минуту и никогда не доходят до кода бота. |
+| Накладные расходы | Цель: меньше 50 мкс на апдейт на горячем пути (сборка словаря и `put_nowait`), сеть — только в фоне. Проверяется бенчмарком в CI. |
+
+Реакция SDK на ответы сервера:
+
+| Ответ | Действие SDK |
+|---|---|
+| `202 Accepted` | батч доставлен |
+| `400 Bad Request` | батч выбрасывается, ошибка в лог (это баг SDK или клиента, ретрай не поможет) |
+| `401 Unauthorized` | отправка останавливается до перезапуска, предупреждение в лог один раз |
+| `409 Conflict` | этот же батч сейчас обрабатывается, ретрай позже |
+| `413 Payload Too Large` | батч делится пополам, половинки отправляются как новые батчи |
+| `429 Too Many Requests` | ретрай после `Retry-After` |
+| `5xx`, таймаут, сеть | ретрай с экспоненциальной задержкой |
+
+### 8.9. Параметры
+
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| `api_key` | — | ключ проекта из дашборда |
+| `endpoint` | `https://ingest.botsight.ru` | адрес приёма (для self-hosted) |
+| `capture_text` | `False` | отправлять тексты сообщений |
+| `skip_text_in_states` | `set()` | состояния FSM, в которых текст не отправляется даже при `capture_text=True` |
+| `redact` | `None` | функция `(text) -> text` для собственного маскирования |
+| `pseudonymize_user_ids` | `False` | заменять `user_id` на HMAC-SHA256 с секретом проекта (первые 8 байт) |
+| `track_fsm` | `True` | отслеживать переходы состояний |
+| `track_blocks` | `True` | подписаться на `my_chat_member` |
+| `batch_size` | `500` | максимум событий в батче |
+| `flush_interval` | `2.0` | максимум секунд между отправками |
+| `max_queue` | `10_000` | лимит очереди в памяти |
+| `sample_rate` | `1.0` | доля пользователей, по которым собираются события (выборка по хешу `user_id`, чтобы воронки оставались целыми) |
+| `enabled` | `True` | выключить SDK, например в тестах |
+
+## 9. Формат событий
+
+Формат — контракт между SDK и сервером. Версия указывается в батче, сервер поддерживает текущую и предыдущую версии.
+
+### 9.1. Батч
+
+`POST /v1/batch`, тело в gzip:
+
+```json
+{
+  "schema_version": 1,
+  "batch_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d80",
+  "sent_at": "2026-10-13T00:12:47.002Z",
+  "sdk": {
+    "name": "botsight-python",
+    "version": "0.1.0",
+    "framework": "aiogram",
+    "framework_version": "3.31.0"
+  },
+  "dropped": 0,
+  "events": [ ... ]
+}
+```
+
+### 9.2. Общие поля события
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `event_id` | UUIDv7 | уникальный идентификатор, генерируется в SDK |
+| `type` | string | `update`, `step`, `outgoing`, `custom`, `lifecycle` |
+| `name` | string | подтип: `message`, `callback_query`, `sendMessage`, `purchase`, `bot_started` |
+| `ts` | RFC 3339, мс | время события по часам бота |
+| `bot_id` | int64 | id бота (часть токена до двоеточия, токен не передаётся) |
+| `user_id` | int64 | id пользователя Telegram или его псевдоним |
+| `chat_id` | int64 | id чата (отрицательный для групп) |
+
+### 9.3. Типы событий
+
+**`update`** — входящий апдейт:
+
+```json
+{
+  "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d81",
+  "type": "update",
+  "name": "message",
+  "ts": "2026-10-13T00:12:45.123Z",
+  "bot_id": 7012345678,
+  "user_id": 123456789,
+  "chat_id": 123456789,
+  "chat_type": "private",
+  "content_type": "text",
+  "command": "start",
+  "start_param": "vk_ads_oct",
+  "text_len": 17,
+  "state": "",
+  "user": { "lang": "ru", "is_premium": false, "has_username": true },
+  "handled": true,
+  "duration_ms": 41
+}
+```
+
+Для нажатия кнопки: `"name": "callback_query"`, `"callback_data": "lab:lab2"`.
+
+**`step`** — обработка хендлером:
+
+```json
+{
+  "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d82",
+  "type": "step",
+  "name": "callback_query",
+  "ts": "2026-10-13T00:12:51.900Z",
+  "bot_id": 7012345678,
+  "user_id": 123456789,
+  "chat_id": 123456789,
+  "handler": "bot.handlers:cb_lab",
+  "state_from": "Form:lab",
+  "state_to": "Form:name",
+  "duration_ms": 12,
+  "error": null
+}
+```
+
+**`outgoing`** — запрос к Bot API:
+
+```json
+{
+  "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d83",
+  "type": "outgoing",
+  "name": "sendDocument",
+  "ts": "2026-10-13T00:13:05.410Z",
+  "bot_id": 7012345678,
+  "user_id": 0,
+  "chat_id": 123456789,
+  "ok": false,
+  "error_code": 403,
+  "error": "bot_blocked",
+  "duration_ms": 87
+}
+```
+
+**`custom`** — ручное событие:
+
+```json
+{
+  "event_id": "0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d84",
+  "type": "custom",
+  "name": "lab_generated",
+  "ts": "2026-10-13T00:13:04.950Z",
+  "bot_id": 7012345678,
+  "user_id": 123456789,
+  "props": { "lab": "lab2", "queue_ms": 340, "gen_ms": 2150 }
+}
+```
+
+**`lifecycle`** — `bot_started` и `bot_stopped` с версиями SDK, фреймворка и Python. На графиках дашборда это отметки деплоев.
+
+### 9.4. Тексты
+
+При `capture_text=True` у события `update` появляется поле `text` (до 4096 символов — максимум длины сообщения в Telegram). `collector` вырезает его из основного события и отправляет в отдельный топик `messages.text` (раздел 11). Основной поток событий персональных текстов не содержит.
+
+## 10. Приём событий: collector
+
+### 10.1. API
+
+```
+POST /v1/batch
+Authorization: Bearer bs_live_ab12cd34_<секрет>
+Content-Type: application/json
+Content-Encoding: gzip
+```
+
+Ограничения: до 500 событий, до 2 МиБ после распаковки, одно событие до 16 КиБ, события не старше 7 дней.
+
+Ответ `202 Accepted`:
+
+```json
+{ "accepted": 500, "duplicate": false }
+```
+
+### 10.2. Обработка запроса
+
+1. **TLS** завершается на балансировщике.
+2. **Аутентификация.** Ключ имеет вид `bs_live_<префикс 8 символов>_<секрет>`. По префиксу проект ищется в LRU-кэше в памяти (TTL 60 с), при промахе — в PostgreSQL. Сравнивается SHA-256 полного ключа через `subtle.ConstantTimeCompare`. Отзыв ключа рассылается всем инстансам через Redis Pub/Sub и сразу сбрасывает кэш.
+3. **Распаковка с лимитом.** `gzip.Reader` берётся из `sync.Pool` и оборачивается в `io.LimitReader` на 2 МиБ: защита от zip-бомб.
+4. **Дедупликация батча** (подробно в 10.4).
+5. **Лимит приёма.** Один вызов Lua-скрипта в Redis на батч забирает из токен-бакета проекта столько токенов, сколько событий в батче. Не хватает токенов — `429` с `Retry-After`.
+6. **Валидация и нормализация.** Проверка обязательных полей и типов, обрезка строк до лимитов. Сервер ставит `received_at`. Если часы бота расходятся с сервером больше чем на 24 часа, `ts` заменяется на `received_at` с флагом `clock_skewed`.
+7. **Разделение.** Тексты уходят в `messages.text`, остальное — в `events.raw`. `project_id` берётся только из ключа.
+8. **Запись в Kafka.** Асинхронная отправка всех записей батча, затем ожидание подтверждения каждой (`acks=all`, идемпотентный продюсер).
+9. **Ответ** `202` — только после подтверждения Kafka. Если Kafka недоступна — `503`, и SDK повторит отправку.
+
+### 10.3. Коды ответов
+
+| Код | Когда |
+|---|---|
+| 202 | батч принят или уже был принят ранее (`"duplicate": true`) |
+| 400 | неверный JSON или схема |
+| 401 | неверный или отозванный ключ |
+| 409 | батч с таким `batch_id` сейчас обрабатывается другим запросом |
+| 413 | превышен размер |
+| 429 | превышен лимит проекта |
+| 503 | Kafka недоступна или идёт остановка инстанса |
+
+### 10.4. Дедупликация батчей
+
+SDK может отправить батч повторно, если не дождался ответа, хотя сервер его уже принял. Дедупликация идёт по батчу, а не по каждому событию: одна операция Redis на запрос.
+
+```
+SET batch:{project_id}:{batch_id} processing NX EX 120
+  ├─ ключ создан    → обработка → успех: SET ... done EX 86400 → 202
+  │                              → ошибка Kafka: DEL ...      → 503
+  └─ ключ уже есть  → значение done        → 202, duplicate: true
+                    → значение processing  → 409, SDK повторит позже
+```
+
+Состояние `processing` нужно, чтобы не потерять батч: если бы второй запрос сразу получил `202`, а первый упал на записи в Kafka, события пропали бы.
+
+### 10.5. Производительность
+
+- Буферы и `gzip.Reader` переиспользуются через `sync.Pool`.
+- В MVP JSON декодируется стандартной библиотекой. Затем профилирование через `pprof` и сравнение с кодогенерацией или потоковым парсером. В v1 — переход на Protobuf + zstd с замером выигрыша.
+- Один запрос в Redis на батч (лимит и дедупликация), ни одного запроса к PostgreSQL на горячем пути.
+- В Go 1.25+ `GOMAXPROCS` по умолчанию учитывает CPU-лимиты cgroup в контейнере.
+
+### 10.6. Остановка без потерь
+
+По `SIGTERM` инстанс переключает readiness-пробу в «не готов», балансировщик перестаёт слать новые запросы, текущие запросы дорабатывают, продюсер Kafka досылает буфер (`Flush`), затем процесс завершается.
+
+## 11. Конвейер данных: Kafka и ClickHouse
+
+### 11.1. Топики
+
+| Топик | Ключ | Партиции | Хранение | Содержимое |
+|---|---|---|---|---|
+| `events.raw` | `project_id:user_id` | 24 | 72 ч | все события без текстов |
+| `messages.text` | `project_id:user_id` | 12 | 24 ч | тексты, только проекты с `capture_text` |
+| `events.dlq` | — | 3 | 7 дней | записи, которые не удалось обработать |
+| `alerts` | `project_id` | 3 | 7 дней | аномалии и срабатывания антифрода |
+
+**Почему ключ `project_id:user_id`, а не `project_id`.** Ключ по проекту дал бы горячую партицию у крупного клиента. Ключ по пользователю распределяет нагрузку равномерно и сохраняет порядок событий одного пользователя внутри партиции. Это нужно `antifraud`, который считает окна по пользователю в памяти.
+
+Настройки продюсера (franz-go): `acks=all`, идемпотентность (по умолчанию в franz-go), сжатие zstd, `linger` 5 мс. Настройки топиков: `replication.factor=3`, `min.insync.replicas=2` в продакшене, 1 реплика в локальном окружении. В заголовках записи передаются `trace_id`, `schema_version` и `project_id`.
+
+### 11.2. ch-writer
+
+Отдельный сервис вместо встроенного движка Kafka в ClickHouse. Причины: контроль размера пачек, дедупликация, DLQ и метрики. Встроенный движок используется как эталон для сравнения в бенчмарке.
+
+1. Читает свои партиции в consumer group.
+2. Копит пачку по каждой партиции: 50 000 строк или 1 секунда.
+3. Перекладывает события в колонки и вставляет через нативный протокол (`clickhouse-go`: `PrepareBatch` → `Append` → `Send`).
+4. Фиксирует смещение в Kafka только после успешной вставки.
+5. Записи, которые не удалось разобрать, уходят в `events.dlq` и не блокируют партицию.
+6. Если ClickHouse недоступен — ретраи с задержкой и пауза чтения партиции (`PauseFetchPartitions`). Растёт лаг, срабатывает алерт, данные ждут в Kafka.
+
+### 11.3. Дубли при падении ch-writer
+
+Проблема: ch-writer вставил пачку, но упал до фиксации смещения. После рестарта он прочитает те же записи и вставит их снова.
+
+Решение — токен дедупликации вставки ClickHouse:
+
+- Каждая вставка выполняется с настройкой `insert_deduplication_token = "events.raw/p{partition}/{first_offset}-{last_offset}"`. ClickHouse отбрасывает повторную вставку блока с тем же токеном (для нереплицированной таблицы нужна настройка `non_replicated_deduplication_window`).
+- Токен работает, только если после рестарта пачка соберётся с **теми же границами**. Поэтому перед вставкой ch-writer сохраняет план `writer:plan:{partition} = last_offset` в Redis. После рестарта первая пачка каждой партиции собирается ровно до сохранённого `last_offset`.
+- Для материализованных представлений включается `deduplicate_blocks_in_dependent_materialized_views = 1`, иначе агрегаты посчитают дубль.
+
+### 11.4. Итоговая семантика доставки
+
+| Участок | Гарантия | Механизм |
+|---|---|---|
+| SDK → collector | at-least-once | ретраи с тем же `batch_id` |
+| collector | дубли батчей отсекаются | `SET NX` в Redis |
+| collector → Kafka | без дублей при ретраях продюсера | идемпотентный продюсер |
+| Kafka → ClickHouse | at-least-once, дубли отсекаются | токен вставки, детерминированные границы пачек |
+| **Итого** | **каждое принятое событие ровно один раз в ClickHouse** | проверяется сверкой в хаос-тестах (раздел 18) |
+
+Единственные допустимые потери — события, выброшенные SDK при переполнении очереди. Они учитываются в счётчике `dropped`.
+
+## 12. Хранилища и схемы
+
+### 12.1. ClickHouse: события
+
+```sql
+CREATE TABLE events
+(
+    project_id     UInt32,
+    bot_id         UInt64,
+    event_id       UUID,
+    ts             DateTime64(3, 'UTC'),
+    received_at    DateTime64(3, 'UTC'),
+    type           LowCardinality(String),   -- update | step | outgoing | custom | lifecycle
+    name           LowCardinality(String),
+    user_id        UInt64,
+    chat_id        Int64,
+    chat_type      LowCardinality(String),
+    content_type   LowCardinality(String),
+    command        LowCardinality(String),
+    start_param    String,
+    callback_data  String,
+    state          LowCardinality(String),   -- состояние в момент апдейта
+    handler        LowCardinality(String),
+    state_from     LowCardinality(String),
+    state_to       LowCardinality(String),
+    handled        UInt8,
+    ok             UInt8,
+    duration_ms    UInt32,
+    error_code     UInt16,
+    error          LowCardinality(String),
+    text_len       UInt16,
+    user_lang      LowCardinality(String),
+    is_premium     UInt8,
+    has_username   UInt8,
+    props_str      Map(LowCardinality(String), String),
+    props_num      Map(LowCardinality(String), Float64)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (project_id, bot_id, toDate(ts), user_id, ts)
+TTL toDateTime(ts) + INTERVAL 13 MONTH
+SETTINGS non_replicated_deduplication_window = 1000;
+```
+
+Решения:
+- **`ORDER BY`** начинается с `project_id`: каждый запрос дашборда фильтрует по проекту, и ClickHouse читает только его гранулы. Затем дата для диапазонов времени и `user_id` для воронок и когорт, которые группируют по пользователю.
+- **`LowCardinality`** для колонок с небольшим числом значений (типы, команды, состояния): словарное кодирование, меньше места и быстрее фильтры.
+- **Партиции по месяцам**: удаление старых данных — это удаление целых партиций.
+- **Две карты свойств** (`props_str`, `props_num`): по числам можно считать `sum`, `avg`, `quantile` без приведения типов.
+- Пустые значения хранятся как `''` и `0`, без `Nullable`: так быстрее.
+
+### 12.2. ClickHouse: тексты
+
+```sql
+CREATE TABLE messages_text
+(
+    project_id  UInt32,
+    bot_id      UInt64,
+    event_id    UUID,
+    ts          DateTime64(3, 'UTC'),
+    user_id     UInt64,
+    state       LowCardinality(String),
+    handled     UInt8,
+    text        String
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(ts)
+ORDER BY (project_id, ts)
+TTL toDateTime(ts) + INTERVAL 30 DAY;
+
+CREATE TABLE message_topics
+(
+    project_id   UInt32,
+    event_id     UUID,
+    topic_id     UInt32,
+    assigned_at  DateTime
+)
+ENGINE = ReplacingMergeTree(assigned_at)
+ORDER BY (project_id, event_id);
+```
+
+Тексты хранятся 30 дней в отдельной таблице. Доступ к ней есть только у `ai-worker` и у экранов, где владелец явно смотрит примеры сообщений. Темы `ai-worker` пишет в отдельную таблицу, а не обновляет тексты: изменения в ClickHouse — тяжёлые мутации.
+
+### 12.3. ClickHouse: агрегаты
+
+Дневные агрегаты для экрана «Обзор»:
+
+```sql
+CREATE TABLE events_daily
+(
+    project_id  UInt32,
+    bot_id      UInt64,
+    day         Date,
+    type        LowCardinality(String),
+    name        LowCardinality(String),
+    events      SimpleAggregateFunction(sum, UInt64),
+    users       AggregateFunction(uniqCombined, UInt64)
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (project_id, bot_id, day, type, name);
+
+CREATE MATERIALIZED VIEW events_daily_mv TO events_daily AS
+SELECT
+    project_id, bot_id, toDate(ts) AS day, type, name,
+    count() AS events,
+    uniqCombinedState(user_id) AS users
+FROM events
+GROUP BY project_id, bot_id, day, type, name;
+```
+
+`uniqCombined` для больших множеств использует HyperLogLog. Его состояния объединяются: DAU за день — это `uniqCombinedMerge(users)` по всем строкам дня, без повторного чтения сырых событий.
+
+Первое касание пользователя для атрибуции:
+
+```sql
+CREATE TABLE user_first_start
+(
+    project_id   UInt32,
+    user_id      UInt64,
+    first_start  SimpleAggregateFunction(min, DateTime64(3, 'UTC')),
+    source       AggregateFunction(argMin, String, DateTime64(3, 'UTC'))
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (project_id, user_id);
+
+CREATE MATERIALIZED VIEW user_first_start_mv TO user_first_start AS
+SELECT project_id, user_id, min(ts) AS first_start, argMinState(start_param, ts) AS source
+FROM events
+WHERE type = 'update' AND command = 'start'
+GROUP BY project_id, user_id;
+```
+
+### 12.4. PostgreSQL: control plane
+
+```sql
+CREATE TABLE accounts (
+    id             BIGSERIAL PRIMARY KEY,
+    email          TEXT UNIQUE,
+    telegram_id    BIGINT UNIQUE,
+    password_hash  TEXT,                         -- argon2id; NULL при входе через Telegram
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE projects (
+    id          SERIAL PRIMARY KEY,
+    owner_id    BIGINT NOT NULL REFERENCES accounts(id),
+    name        TEXT NOT NULL,
+    bot_id      BIGINT,                          -- заполняется по первому событию
+    plan        TEXT NOT NULL DEFAULT 'free',
+    settings    JSONB NOT NULL DEFAULT '{}',     -- срок хранения, сбор текстов и т. п.
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE project_members (
+    project_id  INT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    account_id  BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    role        TEXT   NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
+    PRIMARY KEY (project_id, account_id)
+);
+
+CREATE TABLE api_keys (
+    id           SERIAL PRIMARY KEY,
+    project_id   INT   NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    prefix       TEXT  NOT NULL UNIQUE,          -- bs_live_ab12cd34
+    secret_hash  BYTEA NOT NULL,                 -- SHA-256 полного ключа
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at   TIMESTAMPTZ
+);
+
+CREATE TABLE saved_funnels (
+    id          SERIAL PRIMARY KEY,
+    project_id  INT   NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name        TEXT  NOT NULL,
+    definition  JSONB NOT NULL,                  -- шаги, окно, разбивка
+    created_by  BIGINT REFERENCES accounts(id)
+);
+
+CREATE TABLE ad_spend (
+    project_id  INT     NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source      TEXT    NOT NULL,                -- метка deep link
+    period      DATERANGE NOT NULL,
+    amount_rub  NUMERIC(12, 2) NOT NULL,
+    PRIMARY KEY (project_id, source, period)
+);
+```
+
+### 12.5. Redis
+
+| Ключ | Тип, TTL | Назначение |
+|---|---|---|
+| `rl:{project_id}` | hash | токен-бакет лимита приёма |
+| `batch:{project_id}:{batch_id}` | string, до 24 ч | дедупликация батчей |
+| `writer:plan:{partition}` | string | границы текущей пачки ch-writer |
+| `qcache:{hash}` | string, 60 с | кэш тяжёлых запросов дашборда |
+| `session:{id}` | hash, 30 дней | сессии дашборда |
+| `keys:revoked` | Pub/Sub | сброс кэша ключей во всех collector |
+
+### 12.6. Qdrant
+
+Коллекция `messages`: векторы размерности 384 (см. раздел 14), в payload — `project_id` (индексированное поле), `event_id`, `ts`, `topic_id`. Изоляция клиентов — обязательный фильтр по `project_id` в каждом запросе.
+
+## 13. Аналитика и запросы
+
+### 13.1. Метрики
+
+| Метрика | Определение |
+|---|---|
+| DAU / WAU / MAU | уникальные `user_id` с хотя бы одним событием `update` за день, неделю, 30 дней |
+| Новые пользователи | первый `update` пользователя попал в период |
+| Блокировки | уникальные пользователи с `bot_blocked` или `my_chat_member` → `kicked` |
+| Доля необработанных апдейтов | `update` с `handled = 0` к общему числу |
+| Повторы на шаге | события `step` без ошибки, где `state_from = state_to`, состояние не пустое, а хендлер не отмечен как нейтральный |
+| Время обработки | p50 / p95 / p99 `duration_ms` по хендлерам |
+| Ошибки | исключения в хендлерах (`step.error`) и ошибки Bot API (`outgoing.error`) |
+| Конверсия источника | доля пользователей с первым `/start <метка>`, совершивших целевое событие |
+| Стоимость привлечения | `ad_spend.amount_rub` / число целевых пользователей источника |
+
+### 13.2. Примеры запросов
+
+Воронка анкеты labbot за 30 дней (окно 24 часа):
+
+```sql
+SELECT level, count() AS users
+FROM
+(
+    SELECT
+        user_id,
+        windowFunnel(86400)(
+            toDateTime(ts),
+            type = 'step'   AND state_to = 'Form:lab',
+            type = 'step'   AND state_to = 'Form:name',
+            type = 'step'   AND state_to = 'Form:group',
+            type = 'step'   AND state_to = 'Form:teacher',
+            type = 'step'   AND state_to = 'Form:variant',
+            type = 'step'   AND state_to = 'Form:confirm',
+            type = 'custom' AND name = 'lab_generated'
+        ) AS level
+    FROM events
+    WHERE project_id = {project_id:UInt32}
+      AND ts >= now() - INTERVAL 30 DAY
+    GROUP BY user_id
+)
+GROUP BY level
+ORDER BY level;
+```
+
+`level` — номер последнего достигнутого шага. Число дошедших до шага `k` — сумма по всем `level >= k`; это считает `api`.
+
+Где пользователи застревают:
+
+```sql
+SELECT
+    state_from AS step,
+    countIf(state_from = state_to)              AS retries,
+    uniqExactIf(user_id, state_from = state_to) AS users_with_retries
+FROM events
+WHERE project_id = {project_id:UInt32}
+  AND type = 'step' AND state_from != '' AND error = ''
+  AND handler NOT IN {neutral_handlers:Array(String)}
+  AND ts >= now() - INTERVAL 7 DAY
+GROUP BY step
+ORDER BY retries DESC;
+```
+
+Не каждый хендлер, после которого состояние не изменилось, означает повтор ввода: `/help` посреди анкеты тоже не меняет состояние. Такие хендлеры владелец отмечает в настройках проекта как нейтральные (`neutral_handlers`), падения хендлеров считаются отдельно как ошибки.
+
+Атрибуция по первому касанию:
+
+```sql
+WITH first_touch AS
+(
+    SELECT user_id, argMin(start_param, ts) AS source
+    FROM events
+    WHERE project_id = {project_id:UInt32}
+      AND type = 'update' AND command = 'start'
+    GROUP BY user_id
+)
+SELECT
+    if(source = '', '(без метки)', source) AS source,
+    count() AS users,
+    countIf(user_id IN (
+        SELECT user_id FROM events
+        WHERE project_id = {project_id:UInt32}
+          AND type = 'custom' AND name = 'purchase'
+    )) AS buyers,
+    round(buyers / users * 100, 1) AS conversion_pct
+FROM first_touch
+GROUP BY source
+ORDER BY users DESC;
+```
+
+В продакшене этот запрос читает готовую таблицу `user_first_start` (`argMinMerge(source)`) вместо сырых событий.
+
+Удержание по недельным когортам:
+
+```sql
+SELECT
+    cohort_week,
+    count()   AS users,
+    sum(r[2]) AS week_1,
+    sum(r[3]) AS week_2,
+    sum(r[4]) AS week_3
+FROM
+(
+    SELECT
+        e.user_id,
+        c.cohort_week,
+        retention(
+            toMonday(e.ts) = c.cohort_week,
+            toMonday(e.ts) = c.cohort_week + INTERVAL 1 WEEK,
+            toMonday(e.ts) = c.cohort_week + INTERVAL 2 WEEK,
+            toMonday(e.ts) = c.cohort_week + INTERVAL 3 WEEK
+        ) AS r
+    FROM events AS e
+    INNER JOIN
+    (
+        SELECT user_id, toMonday(min(ts)) AS cohort_week
+        FROM events
+        WHERE project_id = {project_id:UInt32} AND type = 'update'
+        GROUP BY user_id
+    ) AS c USING (user_id)
+    WHERE e.project_id = {project_id:UInt32} AND e.type = 'update'
+    GROUP BY e.user_id, c.cohort_week
+)
+GROUP BY cohort_week
+ORDER BY cohort_week;
+```
+
+Граф сценария (переходы FSM):
+
+```sql
+SELECT state_from, state_to, count() AS transitions, uniqExact(user_id) AS users
+FROM events
+WHERE project_id = {project_id:UInt32}
+  AND type = 'step' AND state_from != state_to
+  AND ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)}
+GROUP BY state_from, state_to;
+```
+
+Сценарии ботов содержат циклы («начать заново»), а диаграмма Sankey циклы не поддерживает. Поэтому граф рисуется как направленный граф с толщиной рёбер по числу пользователей, а для Sankey циклы разворачиваются по номеру шага.
+
+### 13.3. API для дашборда
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET | `/v1/projects/{id}/overview?from&to` | DAU, новые, блокировки, ошибки, отметки деплоев |
+| GET | `/v1/projects/{id}/fsm-graph?from&to` | граф переходов |
+| POST | `/v1/projects/{id}/funnels/query` | воронка по определению: шаги, окно, разбивка |
+| GET | `/v1/projects/{id}/sources?from&to&goal` | атрибуция и стоимость привлечения |
+| GET | `/v1/projects/{id}/retention?period=week` | когорты |
+| GET | `/v1/projects/{id}/errors?from&to` | ошибки хендлеров и Bot API |
+| GET | `/v1/projects/{id}/users/{user_id}/timeline` | события одного пользователя |
+| GET | `/v1/projects/{id}/topics` | AI-темы и тренды |
+| POST | `/v1/projects/{id}/ask` | вопрос на естественном языке |
+| GET | `/v1/projects/{id}/live` | поток событий в реальном времени (SSE) |
+
+Плюс управление: регистрация и вход, проекты, ключи, участники, настройки приватности, расходы на рекламу. Спецификация — OpenAPI в `backend/api/openapi.yaml`, из неё генерируются типы TypeScript для фронтенда.
+
+Правила построителя запросов:
+- SQL строится из типизированных определений (шаги воронки — структуры, а не строки). Значения передаются только как параметры запроса ClickHouse `{name:Type}`.
+- `project_id` подставляется из сессии после проверки членства в проекте.
+- Тяжёлые запросы кэшируются в Redis на 60 секунд с ключом из хеша запроса и округлённого диапазона времени.
+- У пользователя ClickHouse для `api` настроены `max_execution_time`, `max_memory_usage`, `max_rows_to_read`.
+
+## 14. AI-модуль
+
+Работает только для проектов с `capture_text=True`. Сервис `ai-worker` на Python: экосистема ML там богаче, а Go остаётся на пути данных.
+
+### 14.1. Темы и тренды сообщений
+
+1. **Чтение** из `messages.text`.
+2. **Нормализация и дедупликация.** Нижний регистр, схлопывание пробелов, замена телефонов, почт и чисел на токены (`<phone>`, `<num>`). Точные дубли после нормализации отсекаются по хешу: один эмбеддинг на уникальный текст.
+3. **Эмбеддинги** локальной многоязычной моделью (например, `intfloat/multilingual-e5-small`, 384 измерения) батчами на CPU. Тексты не уходят во внешние сервисы.
+4. **Хранение** векторов в Qdrant с `project_id` в payload.
+5. **Кластеризация** раз в час по каждому проекту: HDBSCAN по векторам за 7 дней. HDBSCAN не требует заранее знать число тем и выделяет шум.
+6. **Названия тем.** Для каждого кластера берутся 10 текстов, ближайших к центру, и отправляются в LLM с просьбой дать название и описание в одну строку. Число вызовов LLM равно числу кластеров, а не сообщений.
+7. **Тренды.** Доля темы за последние 7 дней сравнивается с предыдущими 7 днями. Рост в 3 раза и больше при минимальном объёме — алерт.
+8. **Метрика стоимости** — рубли и CPU-секунды на 1000 сообщений. Отслеживается в Grafana и ограничивается тарифом (лимит текстов в день на проект, выборка сверх лимита).
+
+### 14.2. Вопросы на естественном языке
+
+Пользователь пишет «сколько людей из канала ch_tech оплатили на этой неделе?», получает график и SQL, по которому он построен.
+
+1. LLM получает описание схемы `events` с пояснением смысла колонок, а также контекст проекта: найденные состояния FSM, команды, имена ручных событий, метки источников.
+2. LLM возвращает SQL и тип графика из разрешённого списка.
+3. **Проверка до выполнения:** ровно одно выражение, начинается с `SELECT` или `WITH`, без `SETTINGS`, `INTO OUTFILE`, `FORMAT`, ограничение длины.
+4. **Выполнение под отдельным пользователем ClickHouse проекта** (`nl_p{project_id}`):
+   - row policy `project_id = {project_id}` на `events` — даже если LLM напишет запрос по чужому проекту, база вернёт только свои строки;
+   - права только на `SELECT` из `events`, без грантов на табличные функции и внешние источники (`url`, `file`, `remote`, `s3`);
+   - профиль `readonly = 1`, `max_execution_time = 10`, `max_result_rows = 10000`, ограничение памяти.
+5. SQL показывается пользователю: ответ можно проверить.
+
+### 14.3. Объяснение аномалий
+
+1. **Обнаружение — статистика, а не LLM.** Почасовые ряды по каждому проекту: DAU, конверсия ключевой воронки, ошибки, блокировки. База — медиана того же часа недели за последние 4 недели. Отклонение — робастный z-score на основе MAD. Порог настраивается.
+2. **Разложение.** Для аномалии считается вклад сегментов: какие метки источника, состояния FSM, хендлеры или типы ошибок объясняют изменение. Рядом — события `bot_started` (деплои) в окне аномалии.
+3. **Текст.** LLM получает только посчитанные факты в JSON и пишет 2–3 предложения: «Конверсия в оплату упала на 40 % в среду с 14:00, сразу после перезапуска бота. 90 % падения — на шаге `Cart:payment`, там выросли ошибки `bad_request` в `sendInvoice`». LLM ничего не считает сам.
+4. **Доставка** алертов — через Telegram-бота Botsight и в дашборде.
+
+### 14.4. Где запускать LLM
+
+Тексты пользователей — персональные данные. Передача их иностранному провайдеру — трансграничная передача (раздел 19). Поэтому используются модели, размещённые в РФ (GigaChat, YandexGPT), или открытая модель на своём сервере (через vLLM или Ollama). Провайдер скрыт за интерфейсом, чтобы его можно было заменить.
+
+## 15. Антифрод
+
+Задача — оценить долю ботоферм в трафике каждого источника. Особенно важно для Mini Apps и игр с наградами, где за «пользователей» платят.
+
+### 15.1. Сигналы
+
+| Сигнал | Как считается | Почему подозрительно |
+|---|---|---|
+| Всплеск `/start` по метке | число новых пользователей метки за минуту против базового уровня | закупленный «трафик» приходит пачкой |
+| Скорость прохождения шагов | медиана времени между событиями `step` | человек не вводит ФИО за 200 мс |
+| Однородность профилей | доля без username, одинаковый `language_code`, нет премиума | фермы создают аккаунты пачками с одинаковыми настройками |
+| «Возраст» аккаунта | `user_id` в Telegram примерно растёт со временем регистрации — грубая оценка | в источнике много очень новых аккаунтов |
+| Синхронность | разные пользователи совершают действия с одинаковыми интервалами | одинаковые скрипты |
+| Реферальный граф | метки вида `ref_<user_id>` образуют граф «пригласил → приглашённый» | аномально широкие деревья и плотные кластеры |
+
+### 15.2. Реализация
+
+- Сервис `antifraud` на Go читает `events.raw` в своей consumer group. Благодаря ключу `project_id:user_id` каждый инстанс владеет своим подмножеством пользователей и держит их окна в памяти.
+- Признаки считаются в скользящих окнах (1 минута, 1 час, 1 сутки). Для подсчёта уникальных в окнах — HyperLogLog.
+- Скоринг в MVP — взвешенные правила, оценка от 0 до 1 на пользователя. Позже — логистическая регрессия на размеченных данных.
+- Результаты пишутся в ClickHouse (`user_risk`, `ReplacingMergeTree` по времени обновления), алерты — в топик `alerts`.
+- Реферальный граф: компоненты связности через union-find с инкрементальным обновлением, затем поиск плотных подграфов в подозрительных компонентах.
+
+## 16. Дашборд на React
+
+### 16.1. Экраны
+
+| Экран | Что показывает |
+|---|---|
+| Обзор | DAU/WAU/MAU, новые, блокировки, ошибки, p95 обработки, отметки деплоев |
+| Граф сценария | автоматически построенный граф переходов FSM с долями пользователей на рёбрах |
+| Воронки | конструктор из шагов (команда, кнопка, состояние, ручное событие), окно, разбивка по источнику |
+| Источники | метки deep link → пользователи → конверсия → стоимость привлечения |
+| Удержание | когортная таблица (тепловая карта) |
+| Ошибки | исключения в хендлерах, ошибки Bot API, упирания в лимиты, медленные хендлеры |
+| Пользователь | таймлайн событий одного пользователя для разбора проблем |
+| Темы | AI-кластеры сообщений, тренды, примеры |
+| Спросить | вопрос на естественном языке → SQL → график |
+| Антифрод | доля подозрительных пользователей по источникам |
+| Настройки | ключи, приватность, участники, расходы на рекламу |
+
+### 16.2. Подключение нового бота
+
+1. Регистрация через Telegram Login Widget или почту.
+2. Создание проекта → ключ показывается **один раз**.
+3. Готовый фрагмент кода с подставленным ключом.
+4. Экран «Ждём первое событие…» подписан на поток `/live` (SSE) и показывает первые события, как только бот их пришлёт.
+
+### 16.3. Технологии и решения
+
+- React + TypeScript + Vite.
+- TanStack Query: кэширование, повторные запросы, отмена устаревших.
+- React Router.
+- ECharts: граф, воронка, тепловая карта когорт, Sankey и временные ряды в одной библиотеке.
+- Типы API генерируются из OpenAPI (`openapi-typescript`): фронтенд и бэкенд не расходятся.
+- Большие таблицы (таймлайн пользователя) — виртуализированный список.
+- Вход через Telegram: подпись данных виджета проверяется на сервере — HMAC-SHA256, где ключ — SHA-256 от токена бота Botsight.
+- Сессия — cookie `HttpOnly`, `Secure`, `SameSite=Lax`, плюс CSRF-токен для изменяющих запросов. Пароли — argon2id.
+
+## 17. Наблюдаемость и SLO
+
+Grafana и Prometheus — для мониторинга самого Botsight. Клиенты видят свою аналитику в React-дашборде.
+
+### 17.1. Метрики сервисов
+
+| Сервис | Метрики |
+|---|---|
+| collector | `botsight_ingest_requests_total{code}`, `botsight_ingest_events_total`, `botsight_ingest_duration_seconds` (гистограмма), `botsight_kafka_produce_errors_total`, `botsight_ratelimited_total`, `botsight_batch_duplicates_total` |
+| ch-writer | лаг consumer group по партициям, `botsight_ch_insert_rows_total`, `botsight_ch_insert_duration_seconds`, `botsight_dlq_total` |
+| api | `http_request_duration_seconds{route}`, `botsight_query_duration_seconds{kind}`, доля попаданий в кэш |
+| SDK (через батчи) | выброшенные события, ретраи, версии SDK и фреймворков — в ClickHouse |
+
+В метках Prometheus нет `project_id`: тысячи проектов дали бы взрыв кардинальности. Потребление по проектам считается в ClickHouse.
+
+### 17.2. SLO
+
+| Показатель | Цель |
+|---|---|
+| Доступность приёма | 99,9 % запросов `/v1/batch` без 5xx за 30 дней |
+| Задержка приёма | p99 < 50 мс |
+| Свежесть данных | p95 от `ts` события до доступности в запросах < 10 с |
+| Скорость дашборда | p95 запроса < 1 с на диапазоне 30 дней |
+| Потери | 0 потерь после ответа `202` |
+
+### 17.3. Логи и трассировка
+
+Структурированные логи (`log/slog`, JSON). Трассировка OpenTelemetry: `trace_id` создаётся в collector, передаётся в заголовках записей Kafka и продолжается в ch-writer. В Grafana видно, сколько конкретный батч шёл от приёма до ClickHouse.
+
+## 18. Нагрузка, надёжность, тестирование
+
+### 18.1. Симулятор ботов
+
+`loadgen` на Go — генератор реалистичного трафика по тому же протоколу, что и SDK:
+
+- N ботов, у каждого граф сценария с вероятностями переходов и отказов;
+- смесь источников трафика, сессии, возвраты пользователей;
+- инъекции: всплески ботоферм (проверка антифрода), повторные батчи (проверка дедупликации), сдвиг часов;
+- журнал всех отправленных `event_id` для сверки;
+- он же генерирует демо-данные: фронтенд разрабатывается, не дожидаясь реальных ботов.
+
+Для чистой пропускной способности HTTP — сценарии k6.
+
+### 18.2. Цели по производительности
+
+Начальные гипотезы, уточняются после первых замеров.
+
+| Показатель | Цель |
+|---|---|
+| collector, один инстанс | ≥ 50 000 событий/с |
+| Масштабирование collector | близкое к линейному при добавлении инстансов |
+| Сквозная пропускная способность стенда | ≥ 200 000 событий/с |
+| p99 приёма при 70 % от пиковой нагрузки | < 50 мс |
+| Свежесть данных | p95 < 10 с |
+
+### 18.3. Хаос-тесты
+
+| Сценарий | Как воспроизвести | Ожидаемое поведение |
+|---|---|---|
+| Падение collector под нагрузкой | `kill -9` одного инстанса | SDK ретраит, потерь и дублей нет |
+| Падение ch-writer между вставкой и фиксацией смещения | `kill -9` в нужный момент (точка отказа в коде под флагом) | после рестарта тот же токен, дублей нет |
+| ClickHouse недоступен 5 минут | `docker pause` | растёт лаг Kafka, затем система догоняет |
+| Kafka недоступна | остановка брокера | collector отвечает 503, SDK копит события до лимита очереди |
+| Плохая сеть | toxiproxy: +500 мс, 5 % обрывов | ретраи, дедупликация батчей |
+| SDK без сети 10 минут | блокировка исходящих | бот работает, потери равны счётчику `dropped` |
+
+Сверка после каждого прогона:
+
+```sql
+SELECT
+    count()                  AS rows,
+    uniqExact(event_id)      AS unique_events,
+    rows - unique_events     AS duplicates
+FROM events
+WHERE project_id = {loadtest_project:UInt32};
+```
+
+`unique_events` сравнивается с журналом `loadgen` за вычетом `dropped`. Критерий прохождения: `duplicates = 0` и расхождение с журналом равно нулю.
+
+### 18.4. Прочие тесты
+
+- SDK: unit-тесты хуков на фейковом диспетчере aiogram, тест «SDK не ломает бот» (сервер недоступен, сервер отвечает мусором, очередь переполнена), бенчмарк накладных расходов.
+- Go: unit-тесты, интеграционные тесты на testcontainers (Kafka, ClickHouse, Redis, PostgreSQL), бенчмарки горячего пути (`go test -bench`, `-benchmem`), race detector в CI.
+- Фронтенд: тесты компонентов, e2e на Playwright по основным сценариям.
+
+### 18.5. Результат для резюме
+
+В README: графики Grafana под нагрузкой, флеймграфы до и после оптимизаций, отчёт о хаос-тестах и разбор «что упёрлось при нагрузке и как это исправили». На собеседовании этот рассказ ценнее архитектурной схемы.
+
+## 19. Безопасность и персональные данные
+
+### 19.1. Минимизация данных
+
+- По умолчанию не собираются тексты, имена, username, телефоны. Передаются только `user_id`, язык, премиум-статус и признак наличия username.
+- `pseudonymize_user_ids=True` заменяет `user_id` на HMAC с секретом проекта: аналитика работает, а связать данные с аккаунтом Telegram без секрета нельзя.
+- Тексты (если включены): отдельный топик, отдельная таблица, срок хранения 30 дней, исключение состояний (`skip_text_in_states`), маскирование (`redact`).
+
+### 19.2. 152-ФЗ
+
+- Персональные данные граждан РФ хранятся в базах на территории РФ (ч. 5 ст. 18): хостинг в российском облаке.
+- Владелец бота — оператор персональных данных, Botsight обрабатывает их по его поручению (ч. 3 ст. 6). Нужны оферта с условиями поручения и политика обработки данных.
+- Передача текстов иностранному LLM-провайдеру — трансграничная передача (ст. 12). Поэтому LLM размещена в РФ или на своём сервере (раздел 14.4).
+- Удаление по запросу: `DELETE /v1/projects/{id}/users/{user_id}` выполняет облегчённое удаление в ClickHouse (`DELETE FROM events WHERE project_id = … AND user_id = …`) и удаление векторов в Qdrant.
+
+Перед коммерческим запуском юридическую часть нужно проверить с юристом.
+
+### 19.3. Изоляция клиентов
+
+- `project_id` всегда берётся из ключа (collector) или из сессии с проверкой членства (api), никогда из тела запроса.
+- Все запросы к ClickHouse параметризованы и содержат `project_id`. Тест в CI проверяет, что каждый запрос построителя содержит фильтр по проекту.
+- Для NL→SQL дополнительно — row policy в ClickHouse (раздел 14.2).
+
+### 19.4. Ключи и секреты
+
+- Ключ показывается один раз, хранится только SHA-256. Ротация: новый ключ работает сразу, старый отзывается вручную.
+- Секреты сервисов — в переменных окружения из менеджера секретов, не в репозитории.
+- TLS на всех внешних соединениях, шифрование дисков с данными.
+
+### 19.5. Защита от злоупотреблений
+
+Лимиты на проект (раздел 10.2), лимиты размера батча и события, защита от zip-бомб, лимиты на вход в дашборд по IP и аккаунту.
+
+## 20. Режим прокси Bot API
+
+Запасной режим на будущее — для ботов на языках, под которые ещё нет SDK. Владелец меняет одну строку: адрес Bot API. В aiogram это `AiohttpSession(api=TelegramAPIServer.from_base("https://api.botsight.ru"))`. Шлюз на Go пропускает все запросы бота к Telegram через себя.
+
+Минусы, из-за которых режим не основной:
+- шлюз на пути каждого сообщения: если он упал, у клиента лёг бот;
+- токен бота проходит через Botsight, а кто владеет токеном, тот владеет ботом;
+- не видны состояния FSM.
+
+Инженерные задачи режима:
+- **Парсить ответы, а не запросы.** `sendDocument` — multipart с файлом, запрос проксируется потоком без буферизации. Метаданные берутся из ответа Telegram: там весь отправленный `Message`. Пути `/file/...` пропускаются без разбора.
+- **Long polling.** Каждый бот держит открытый `getUpdates` (в aiogram по умолчанию 10 секунд). Тысячи ботов — тысячи висящих соединений к одному хосту `api.telegram.org`. У `http.Transport` по умолчанию `MaxIdleConnsPerHost = 2`, без настройки соединения будут открываться заново. Таймауты шлюза должны быть больше таймаута polling.
+- **Дубли.** После перезапуска бота Telegram отдаёт неподтверждённые апдейты повторно → дедупликация по `(bot_id, update_id)`.
+- **Вебхуки.** Бот вызывает `setWebhook` через шлюз, шлюз подменяет `url` на свой и запоминает оригинальный адрес для пересылки.
+- **Токен.** Не логировать, хранить только хеш для сверки, бот определяется по части токена до двоеточия.
+
+## 21. Ключевые архитектурные решения
+
+| Решение | Альтернатива | Почему так |
+|---|---|---|
+| Сбор через SDK | прокси Bot API | бот работает при падении Botsight, токен не покидает клиента, видны шаги FSM |
+| Kafka между приёмом и хранилищем | вставка в ClickHouse напрямую из collector | развязка по скорости, буфер на время сбоев ClickHouse, несколько потребителей, повторное чтение |
+| ClickHouse для событий | PostgreSQL / TimescaleDB | колоночное хранение и сжатие, `windowFunnel` и `retention` из коробки, скорость агрегаций |
+| Свой ch-writer | Kafka Engine в ClickHouse | контроль пачек, дедупликация, DLQ, метрики; встроенный движок — эталон для сравнения |
+| PostgreSQL для аккаунтов | всё в ClickHouse | транзакции, внешние ключи, частые точечные обновления |
+| Тексты в отдельном топике и таблице | общий поток событий | приватность: короткий срок хранения, доступ только у ai-worker |
+| JSON в MVP, Protobuf в v1 | сразу Protobuf | проще отлаживать на старте; выигрыш от перехода измеряется бенчмарком |
+| ai-worker на Python | на Go | экосистема ML; Go остаётся на пути данных |
+| Дедупликация по батчу | по каждому событию | одна операция Redis на запрос вместо сотен |
+
+## 22. Модули повышенной сложности
+
+Для двоих реально взять 2–3 модуля. Каждый — за интерфейсом, с бенчмарком «до и после».
+
+| Модуль | Что сделать | Как доказать |
+|---|---|---|
+| Распределённый лимитер | Lua-скрипт в Redis → локальные токен-бакеты, которые арендуют токены пачками, чтобы реже ходить в Redis | точность лимита под нагрузкой с несколькими инстансами, число запросов к Redis |
+| Доставка без потерь и дублей | всё из разделов 10.4 и 11.3, точки отказа под флагами | отчёт хаос-тестов и сверки |
+| Горячий путь collector | профилирование, пулы, свой декодер, Protobuf + zstd | флеймграфы и `-benchmem` до и после |
+| Своё колоночное хранилище событий | сегменты с delta + varint и словарным кодированием, индекс по времени, компакция, HyperLogLog | сравнение с ClickHouse на одинаковых запросах и честный разбор проигрышей |
+| Инкрементальный антифрод на графах | раздел 15.2 | точность на размеченных инъекциях `loadgen` |
+| Рассылки по сегментам | сегмент из дашборда → задание; SDK забирает задание и отправляет сообщения сам, токен по-прежнему не покидает бот; соблюдение лимитов Telegram (по FAQ: около 30 сообщений в секунду при массовой рассылке, не больше одного сообщения в секунду в один чат) | скорость рассылки, доля упираний в 429 |
+
+## 23. Технологический стек
+
+| Область | Технологии |
+|---|---|
+| SDK | Python 3.10+, aiogram 3, aiohttp |
+| Backend | Go 1.25+, `net/http` + chi, franz-go (Kafka), clickhouse-go v2, pgx, go-redis, prometheus/client_golang, OpenTelemetry, `log/slog` |
+| Шина | Apache Kafka в режиме KRaft (в локальной разработке можно Redpanda) |
+| Хранилища | ClickHouse, PostgreSQL, Redis, Qdrant |
+| AI | Python, sentence-transformers, scikit-learn (HDBSCAN), LLM в РФ или своя через vLLM/Ollama |
+| Frontend | React, TypeScript, Vite, TanStack Query, React Router, ECharts |
+| Инфраструктура | Docker Compose (разработка и стенд), позже Kubernetes; GitHub Actions |
+| Наблюдаемость | Prometheus, Grafana, OpenTelemetry |
+| Тестирование | pytest, `go test`, testcontainers, k6, toxiproxy, Playwright |
+
+## 24. Структура репозитория
+
+```
+botsight/
+├── sdk/
+│   └── python/                 # пакет botsight: setup(), middleware, клиент доставки
+├── backend/                    # один Go-модуль
+│   ├── cmd/
+│   │   ├── collector/          # приём событий
+│   │   ├── chwriter/           # Kafka → ClickHouse
+│   │   ├── api/                # REST для дашборда, auth, проекты
+│   │   ├── antifraud/          # стриминговые признаки и скоринг
+│   │   └── loadgen/            # симулятор ботов
+│   ├── internal/
+│   │   ├── event/              # схема событий и валидация
+│   │   ├── ingest/             # обработка батчей
+│   │   ├── kafka/
+│   │   ├── clickhouse/
+│   │   ├── query/              # построитель запросов: воронки, удержание, источники
+│   │   ├── ratelimit/
+│   │   └── auth/
+│   └── api/openapi.yaml
+├── ai/                         # Python: эмбеддинги, темы, NL→SQL, аномалии
+├── web/                        # React + TypeScript
+├── migrations/
+│   ├── clickhouse/
+│   └── postgres/
+├── deploy/
+│   ├── docker-compose.yml
+│   └── grafana/                # дашборды как код
+├── loadtest/                   # сценарии k6 и хаос-тестов
+└── docs/
+```
+
+## 25. Распределение работы
+
+Предложение для двоих. Оба пишут на Go: это курс по Go.
+
+| | Участник A | Участник B |
+|---|---|---|
+| Зона | SDK, control plane, фронтенд | data plane, надёжность, нагрузка |
+| MVP | SDK на Python; сервис `api` (проекты, ключи, построитель запросов); React-дашборд | `collector`; Kafka; `ch-writer`; схема ClickHouse и агрегаты; `loadgen`; Grafana |
+| Дальше | AI-модуль | антифрод, хаос-тесты, оптимизация горячего пути |
+
+**Контракт в первую неделю:** формат событий (раздел 9), DDL ClickHouse (раздел 12) и OpenAPI. После этого участники работают параллельно: A строит дашборд на демо-данных из `loadgen`, B — конвейер под реальные батчи SDK.
+
+## 26. Дорожная карта
+
+Длительность этапов нужно подогнать под срок курса.
+
+| Этап | Содержание | Критерий готовности |
+|---|---|---|
+| 0. Фундамент (≈ 1 неделя) | репозиторий, CI (линтеры, тесты, сборка образов), docker-compose со всеми хранилищами, контракт событий, миграции | `docker compose up` поднимает всё окружение |
+| 1. MVP | SDK (три хука, батчи, ретраи); collector (ключи, валидация, Kafka); ch-writer; api (проекты, ключи, обзор, воронка, источники); дашборд (вход, подключение бота, обзор, воронка, источники); подключение labbot | события labbot видны в дашборде меньше чем через 10 секунд |
+| 2. Надёжность и нагрузка | дедупликация батчей и вставок, лимиты, DLQ, дашборды Grafana, нагрузочные и хаос-тесты со сверкой; экраны удержания, графа сценария, ошибок, таймлайна | отчёт: цели раздела 18 достигнуты или разобрано, почему нет |
+| 3. AI и антифрод | темы и тренды, NL→SQL, объяснение аномалий, антифрод | AI-темы на реальных текстах пилотного бота, антифрод ловит инъекции `loadgen` |
+| 4. Сложные модули и пилоты | 2–3 модуля из раздела 22; 3–5 пилотных ботов; интервью; тарифы | пилоты пользуются дашбордом, есть данные для акселератора |
+
+## 27. Монетизация и коммерциализация
+
+### 27.1. Модель
+
+Подписка по числу активных пользователей ботов в месяц (MAU). Владельцу бота эта величина понятнее, чем «число событий».
+
+| Тариф | Гипотеза содержания |
+|---|---|
+| Free | 1 бот, ограниченный MAU, хранение 30 дней, базовые экраны |
+| Pro | несколько ботов, больший MAU, хранение 13 месяцев, AI-темы, алерты |
+| Business | NL→SQL, антифрод, SLA, выделенное хранение, self-hosted |
+
+Цены и границы тарифов определяются после интервью с клиентами.
+
+### 27.2. Проверка спроса
+
+- 10 интервью с владельцами ботов до активной разработки (начать с бывших заказчиков по фрилансу): что они уже пытаются считать и за что готовы платить.
+- 3–5 пилотных ботов бесплатно в обмен на обратную связь. Первый пилот — labbot.
+- Метрики пилота: доля владельцев, которые заходят в дашборд еженедельно; какие экраны используют; что попросили добавить.
+
+### 27.3. Поддержка
+
+- Грант ФСИ «Студенческий стартап»: в 2025 году 2,5 тыс. студентов получили по 1 млн ₽ на свои стартапы ([источник](https://www.bizon.ru/news/print/id/738186/format/smoothbox)). Получателю нужно зарегистрировать юрлицо. Актуальные условия — на сайте фонда.
+- Акселератор вуза и программа «Стартап как диплом», если она есть в вузе.
+- Для питча: данные пилотов из раздела 27.2.
+
+## 28. Риски и открытые вопросы
+
+| Риск или вопрос | Что делаем |
+|---|---|
+| Какие решения аналитики ботов уже есть на рынке | исследовать конкурентов до питча и сформулировать отличия (две строки, FSM-воронки, AI, приватность) |
+| SDK нужен под каждый фреймворк | начать с aiogram, формат событий общий; прокси-режим как запасной вариант |
+| Владельцы не доверяют сторонней аналитике | приватность по умолчанию, псевдонимизация, договор поручения, self-hosted для крупных |
+| Стоимость инфраструктуры | один VPS для стенда, Redpanda вместо Kafka в разработке, агрегаты вместо сырых запросов |
+| Объём работ для двоих | строгий MVP, из сложных модулей — 2–3 |
+| Изменения Bot API и aiogram | версионирование SDK, тесты на нескольких версиях aiogram в CI |
+| Срок курса неизвестен | подогнать этапы раздела 26 |
+
+## 29. Глоссарий
+
+| Термин | Значение |
+|---|---|
+| Апдейт (update) | любое входящее событие от Telegram: сообщение, нажатие кнопки, изменение статуса участника |
+| FSM | конечный автомат состояний в aiogram, которым описываются многошаговые сценарии |
+| Deep link | ссылка `t.me/bot?start=<метка>`; метка до 64 символов приходит боту вместе с `/start` |
+| `callback_data` | данные, привязанные к inline-кнопке |
+| Воронка | последовательность шагов и доля пользователей, дошедших до каждого |
+| Когорта | группа пользователей, впервые пришедших в один период |
+| MAU | уникальные активные пользователи за 30 дней |
+| DLQ | dead letter queue — очередь для записей, которые не удалось обработать |
+| SLO | целевой уровень качества сервиса |
+| HyperLogLog | вероятностная структура для приближённого подсчёта уникальных значений |
+
+---
+
+Источники:
+- [Bizon: гранты «Студенческий стартап» 2025](https://www.bizon.ru/news/print/id/738186/format/smoothbox)
+- [Telegram Bot FAQ: лимиты отправки сообщений](https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this)
