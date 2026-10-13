@@ -40,6 +40,7 @@ type options struct {
 	concurrency int
 	batch       int
 	duplicates  float64
+	texts       bool
 	journal     string
 }
 
@@ -55,6 +56,7 @@ func main() {
 	flag.IntVar(&o.concurrency, "concurrency", 32, "parallel senders")
 	flag.IntVar(&o.batch, "batch", 500, "events per batch (max 500)")
 	flag.Float64Var(&o.duplicates, "duplicates", 0, "fraction of batches sent twice (checks deduplication)")
+	flag.BoolVar(&o.texts, "texts", false, "enable capture_text and send message texts on several topics (for the AI module)")
 	flag.StringVar(&o.journal, "journal", "", "file to write accepted event_ids to, for reconciliation")
 	flag.Parse()
 
@@ -115,6 +117,7 @@ func run(o options) error {
 		go func(worker int) {
 			defer wg.Done()
 			gen := newGenerator(worker, o.users)
+			gen.texts = o.texts
 			next := time.Now()
 			for n := worker; runCtx.Err() == nil; n += o.concurrency {
 				p := projects[n%len(projects)]
@@ -176,6 +179,7 @@ func setupProjects(ctx context.Context, o options) ([]project, error) {
 		map[string]string{"email": email, "password": "loadgen-password"}, &session); err != nil {
 		return nil, fmt.Errorf("register via %s: %w", o.api, err)
 	}
+	fmt.Printf("account %s, password loadgen-password\n", email)
 	var out []project
 	for i := 0; i < o.projects; i++ {
 		var resp struct {
@@ -187,13 +191,25 @@ func setupProjects(ctx context.Context, o options) ([]project, error) {
 			return nil, fmt.Errorf("create project: %w", err)
 		}
 		out = append(out, project{id: resp.Project.ID, key: resp.Key.Key})
+		if o.texts {
+			var ignored map[string]any
+			settings := map[string]any{"settings": map[string]any{"capture_text": true, "neutral_handlers": []string{}}}
+			if err := apiCallMethod(ctx, c, "PATCH", session.CSRF,
+				fmt.Sprintf("%s/v1/projects/%d", o.api, resp.Project.ID), settings, &ignored); err != nil {
+				return nil, fmt.Errorf("enable capture_text: %w", err)
+			}
+		}
 	}
 	return out, nil
 }
 
 func apiCall(ctx context.Context, c *http.Client, csrf, url string, body, out any) error {
+	return apiCallMethod(ctx, c, "POST", csrf, url, body, out)
+}
+
+func apiCallMethod(ctx context.Context, c *http.Client, method, csrf, url string, body, out any) error {
 	b, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
@@ -222,6 +238,23 @@ type generator struct {
 	users int
 	state map[int]int
 	buf   bytes.Buffer
+	texts bool // add message texts for the AI module
+}
+
+// phrases are user messages on a few support topics plus small talk, for -texts.
+var phrases = [][]string{
+	{"не приходит код", "код подтверждения не пришел", "смс с кодом не приходит", "жду код уже 10 минут", "не получил код на телефон"},
+	{"не могу оплатить", "оплата не проходит", "карта отклонена при оплате", "деньги списались а подписки нет", "не проходит платеж"},
+	{"добавьте лабу по физике", "нужна лабораторная по химии", "когда будет лаба 5", "сделайте лабораторную по сетям", "нет моей лабы в списке"},
+	{"бот не отвечает", "бот завис после нажатия", "кнопка не работает", "бот молчит уже час", "не работает меню бота"},
+	{"привет", "спасибо", "ок", "как дела"},
+}
+
+var suffixes = []string{"", "!", " пожалуйста", " срочно", "??", " помогите"}
+
+func (g *generator) text() string {
+	topic := phrases[g.rnd.IntN(len(phrases))]
+	return topic[g.rnd.IntN(len(topic))] + suffixes[g.rnd.IntN(len(suffixes))]
 }
 
 var (
@@ -253,6 +286,10 @@ func (g *generator) batch(n int) (ids []string, body []byte) {
 		update["chat_type"], update["content_type"], update["text_len"] = "private", "text", 5+g.rnd.IntN(40)
 		update["state"], update["handled"], update["duration_ms"] = states[step], true, g.rnd.IntN(50)
 		update["user"] = map[string]any{"lang": "ru", "is_premium": g.rnd.IntN(20) == 0, "has_username": true}
+		if g.texts && step > 0 {
+			text := g.text()
+			update["text"], update["text_len"] = text, len([]rune(text))
+		}
 		if step == 0 {
 			update["command"], update["start_param"] = "start", sources[g.rnd.IntN(len(sources))]
 		}

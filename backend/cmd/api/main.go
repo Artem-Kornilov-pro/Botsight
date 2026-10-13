@@ -11,9 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/clickhouse"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/config"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/httpapi"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/mail"
@@ -68,13 +70,28 @@ func run() error {
 		mailer = mail.SMTP{Addr: cfg.SMTPAddr, From: cfg.SMTPFrom, Username: cfg.SMTPUsername, Password: cfg.SMTPPassword}
 	}
 
+	var ch driver.Conn
+	if cfg.ClickHouseAddr != "" {
+		ch, err = clickhouse.Open(ctx, clickhouse.Options{
+			Addr: []string{cfg.ClickHouseAddr}, Database: cfg.ClickHouseDatabase,
+			Username: cfg.ClickHouseUser, Password: cfg.ClickHousePassword,
+		})
+		if err != nil {
+			return err
+		}
+		defer ch.Close()
+	} else {
+		logger.Warn("CLICKHOUSE_ADDR is not set: topics and alerts endpoints are disabled")
+	}
+
 	srv := httpapi.New(httpapi.Deps{
-		Store:    store.New(pool),
-		Sessions: session.NewStore(rdb, cfg.SessionTTL),
-		Limiter:  ratelimit.NewWindow(rdb),
-		Redis:    rdb,
-		Mailer:   mailer,
-		Logger:   logger,
+		Store:      store.New(pool),
+		Sessions:   session.NewStore(rdb, cfg.SessionTTL),
+		Limiter:    ratelimit.NewWindow(rdb),
+		Redis:      rdb,
+		Mailer:     mailer,
+		Logger:     logger,
+		ClickHouse: ch,
 		Options: httpapi.Options{
 			DashboardURL:  cfg.DashboardURL,
 			CORSOrigins:   cfg.CORSOrigins,
@@ -82,6 +99,8 @@ func run() error {
 			SessionTTL:    cfg.SessionTTL,
 			TrustProxy:    cfg.TrustProxy,
 			TelegramToken: cfg.TelegramToken,
+			AIURL:         cfg.AIURL,
+			AIToken:       cfg.AIInternalToken,
 			Limits:        httpapi.DefaultLimits(),
 		},
 	})

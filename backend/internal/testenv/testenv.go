@@ -213,6 +213,8 @@ func (e *Env) startClickHouse(ctx context.Context) error {
 		tcclickhouse.WithDatabase("botsight"),
 		tcclickhouse.WithUsername("botsight"),
 		tcclickhouse.WithPassword("botsight"),
+		// as in docker compose: migrations create a settings profile, ai-worker creates users
+		testcontainers.WithEnv(map[string]string{"CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT": "1"}),
 	)
 	e.track(c)
 	if err != nil {
