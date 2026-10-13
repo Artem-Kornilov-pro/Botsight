@@ -1,0 +1,72 @@
+# Local environment: docker compose -f deploy/docker-compose.yml up --build
+#   api      http://localhost:8080
+#   Mailpit  http://localhost:8025 (emails sent by the api)
+name: botsight
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: botsight
+      POSTGRES_USER: botsight
+      POSTGRES_PASSWORD: botsight
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U botsight -d botsight"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports:
+      - "127.0.0.1:8025:8025" # web UI
+      - "127.0.0.1:1025:1025" # SMTP
+
+  migrate:
+    image: migrate/migrate:v4.18.1
+    volumes:
+      - ../migrations/postgres:/migrations:ro
+    command: ["-path", "/migrations", "-database", "postgres://botsight:botsight@postgres:5432/botsight?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ../backend
+      args:
+        SERVICE: api
+    environment:
+      DATABASE_URL: postgres://botsight:botsight@postgres:5432/botsight?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      DASHBOARD_URL: http://localhost:5173
+      COOKIE_SECURE: "false" # plain http locally
+      SMTP_ADDR: mailpit:1025
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      LOG_LEVEL: debug
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+
+volumes:
+  postgres-data:

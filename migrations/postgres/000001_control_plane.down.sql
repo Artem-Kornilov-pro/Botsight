@@ -1,0 +1,8 @@
+DROP TABLE IF EXISTS ad_spend;
+DROP TABLE IF EXISTS saved_funnels;
+DROP TABLE IF EXISTS api_keys;
+DROP TABLE IF EXISTS project_members;
+DROP TABLE IF EXISTS projects;
+DROP TABLE IF EXISTS account_tokens;
+DROP TABLE IF EXISTS accounts;
+DROP EXTENSION IF EXISTS btree_gist;

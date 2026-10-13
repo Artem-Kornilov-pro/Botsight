@@ -665,7 +665,7 @@ SET batch:{project_id}:{batch_id} processing NX EX 120
 - Буферы и `gzip.Reader` переиспользуются через `sync.Pool`.
 - В MVP JSON декодируется стандартной библиотекой. Затем профилирование через `pprof` и сравнение с кодогенерацией или потоковым парсером. В v1 — переход на Protobuf + zstd с замером выигрыша.
 - Один запрос в Redis на батч (лимит и дедупликация), ни одного запроса к PostgreSQL на горячем пути.
-- В Go 1.25+ `GOMAXPROCS` по умолчанию учитывает CPU-лимиты cgroup в контейнере.
+- Начиная с Go 1.25 `GOMAXPROCS` по умолчанию учитывает CPU-лимиты cgroup в контейнере.
 
 ### 10.6. Остановка без потерь
 
@@ -853,57 +853,22 @@ GROUP BY project_id, user_id;
 
 ### 12.4. PostgreSQL: control plane
 
-```sql
-CREATE TABLE accounts (
-    id             BIGSERIAL PRIMARY KEY,
-    email          TEXT UNIQUE,
-    telegram_id    BIGINT UNIQUE,
-    password_hash  TEXT,                         -- argon2id; NULL при входе через Telegram
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+Схема — в миграциях [`migrations/postgres/`](migrations/postgres/). В локальном окружении их применяет контейнер `migrate` (golang-migrate), в интеграционных тестах — тот же набор файлов.
 
-CREATE TABLE projects (
-    id          SERIAL PRIMARY KEY,
-    owner_id    BIGINT NOT NULL REFERENCES accounts(id),
-    name        TEXT NOT NULL,
-    bot_id      BIGINT,                          -- заполняется по первому событию
-    plan        TEXT NOT NULL DEFAULT 'free',
-    settings    JSONB NOT NULL DEFAULT '{}',     -- срок хранения, сбор текстов и т. п.
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+| Таблица | Содержимое |
+|---|---|
+| `accounts` | почта (в нижнем регистре), хеш пароля argon2id, `telegram_id` и username, имя, время подтверждения почты. Должен быть хотя бы один способ входа: почта или Telegram |
+| `account_tokens` | одноразовые ссылки из писем: подтверждение почты (48 часов) и сброс пароля (1 час). Хранится только SHA-256 токена и адрес, на который ушло письмо |
+| `projects` | название, `bot_id` (по первому событию), тариф, настройки в JSONB: `capture_text`, `neutral_handlers` |
+| `project_members` | роль участника: `owner`, `editor` или `viewer`. Владельцев может быть несколько, отдельного `owner_id` у проекта нет |
+| `api_keys` | префикс `bs_live_ab12cd34` (уникальный), SHA-256 полного ключа, название, кто создал, время отзыва |
+| `saved_funnels` | сохранённые воронки: название и определение в JSONB (шаги, окно, разбивка) |
+| `ad_spend` | расходы по метке deep link за период дней `DATERANGE`, сумма `NUMERIC(12, 2)` |
 
-CREATE TABLE project_members (
-    project_id  INT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    account_id  BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    role        TEXT   NOT NULL CHECK (role IN ('owner', 'editor', 'viewer')),
-    PRIMARY KEY (project_id, account_id)
-);
-
-CREATE TABLE api_keys (
-    id           SERIAL PRIMARY KEY,
-    project_id   INT   NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    prefix       TEXT  NOT NULL UNIQUE,          -- bs_live_ab12cd34
-    secret_hash  BYTEA NOT NULL,                 -- SHA-256 полного ключа
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    revoked_at   TIMESTAMPTZ
-);
-
-CREATE TABLE saved_funnels (
-    id          SERIAL PRIMARY KEY,
-    project_id  INT   NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    name        TEXT  NOT NULL,
-    definition  JSONB NOT NULL,                  -- шаги, окно, разбивка
-    created_by  BIGINT REFERENCES accounts(id)
-);
-
-CREATE TABLE ad_spend (
-    project_id  INT     NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    source      TEXT    NOT NULL,                -- метка deep link
-    period      DATERANGE NOT NULL,
-    amount_rub  NUMERIC(12, 2) NOT NULL,
-    PRIMARY KEY (project_id, source, period)
-);
-```
+Решения:
+- **Последний владелец.** Смена роли и удаление участника идут в транзакции с блокировкой строки проекта: проект нельзя оставить без владельца, даже если два запроса пришли одновременно.
+- **Расходы не пересекаются.** Ограничение `EXCLUDE USING gist (project_id WITH =, source WITH =, period WITH &&)` (расширение `btree_gist`) не даёт дважды учесть расходы одной метки за один день.
+- **Удаление проекта** каскадно удаляет участников, ключи, воронки и расходы. Префиксы активных ключей перед этим публикуются в `keys:revoked`.
 
 ### 12.5. Redis
 
@@ -913,7 +878,9 @@ CREATE TABLE ad_spend (
 | `batch:{project_id}:{batch_id}` | string, до 24 ч | дедупликация батчей |
 | `writer:plan:{partition}` | string | границы текущей пачки ch-writer |
 | `qcache:{hash}` | string, 60 с | кэш тяжёлых запросов дашборда |
-| `session:{id}` | hash, 30 дней | сессии дашборда |
+| `session:{sha256(token)}` | hash, 30 дней с последнего запроса | сессия дашборда: `account_id`, CSRF-токен, время входа. В cookie лежит сам токен, в Redis — только его хеш |
+| `account_sessions:{account_id}` | set | сессии аккаунта, чтобы завершить их все после смены или сброса пароля |
+| `rl:{правило}:{ключ}` | string, окно лимита | счётчики попыток входа, регистрации и сброса пароля (раздел 19.5) |
 | `keys:revoked` | Pub/Sub | сброс кэша ключей во всех collector |
 
 ### 12.6. Qdrant
@@ -1075,7 +1042,21 @@ GROUP BY state_from, state_to;
 | POST | `/v1/projects/{id}/ask` | вопрос на естественном языке |
 | GET | `/v1/projects/{id}/live` | поток событий в реальном времени (SSE) |
 
-Плюс управление: регистрация и вход, проекты, ключи, участники, настройки приватности, расходы на рекламу. Спецификация — OpenAPI в `backend/api/openapi.yaml`, из неё генерируются типы TypeScript для фронтенда.
+Плюс управление (реализовано в сервисе `api`):
+
+| Группа | Эндпоинты |
+|---|---|
+| Вход | `POST /v1/auth/register`, `/login`, `/telegram`, `/logout`, `/password-reset`, `/password-reset/confirm`, `/verify-email` |
+| Аккаунт | `GET`/`PATCH /v1/account`, `POST /v1/account/password`, `/verify-email`, `/telegram` (привязка), `DELETE /v1/account/sessions` |
+| Проекты | `GET`/`POST /v1/projects`, `GET`/`PATCH`/`DELETE /v1/projects/{id}` |
+| Участники | `GET`/`POST /v1/projects/{id}/members`, `PATCH`/`DELETE /v1/projects/{id}/members/{account_id}` |
+| Ключи | `GET`/`POST /v1/projects/{id}/keys`, `DELETE /v1/projects/{id}/keys/{key_id}` |
+| Воронки | `GET`/`POST /v1/projects/{id}/funnels`, `GET`/`PUT`/`DELETE /v1/projects/{id}/funnels/{funnel_id}` |
+| Расходы | `GET`/`POST /v1/projects/{id}/ad-spend`, `DELETE /v1/projects/{id}/ad-spend/{spend_id}` |
+
+Права: `viewer` читает, `editor` ещё меняет настройки, воронки и расходы, `owner` ещё управляет ключами и участниками и удаляет проект. Участник может сам выйти из проекта. Чужой проект отвечает `404`, а не `403`, чтобы нельзя было проверить его существование. Ошибки — `{"error": {"code", "message", "field"}}` со стабильными кодами, дашборд показывает по ним свои тексты.
+
+Спецификация — OpenAPI в [`backend/api/openapi.yaml`](backend/api/openapi.yaml), из неё генерируются типы TypeScript для фронтенда. Тест сверяет её с маршрутами роутера: недокументированный эндпоинт ломает сборку.
 
 Правила построителя запросов:
 - SQL строится из типизированных определений (шаги воронки — структуры, а не строки). Значения передаются только как параметры запроса ClickHouse `{name:Type}`.
@@ -1178,8 +1159,10 @@ GROUP BY state_from, state_to;
 - ECharts: граф, воронка, тепловая карта когорт, Sankey и временные ряды в одной библиотеке.
 - Типы API генерируются из OpenAPI (`openapi-typescript`): фронтенд и бэкенд не расходятся.
 - Большие таблицы (таймлайн пользователя) — виртуализированный список.
-- Вход через Telegram: подпись данных виджета проверяется на сервере — HMAC-SHA256, где ключ — SHA-256 от токена бота Botsight.
-- Сессия — cookie `HttpOnly`, `Secure`, `SameSite=Lax`, плюс CSRF-токен для изменяющих запросов. Пароли — argon2id.
+- Вход через Telegram: подпись данных виджета проверяется на сервере — HMAC-SHA256, где ключ — SHA-256 от токена бота Botsight. Данные старше суток не принимаются. Telegram можно привязать к аккаунту с почтой и входить любым способом.
+- Сессия — cookie `bs_session` (`HttpOnly`, `Secure`, `SameSite=Lax`), живёт 30 дней с последнего запроса. Ответ на вход и `GET /v1/account` содержат `csrf_token`: дашборд отправляет его в заголовке `X-CSRF-Token` в каждом изменяющем запросе. Тела запросов — только JSON.
+- Пароли — argon2id (m = 19 МиБ, t = 2, p = 1). Для неизвестной почты сервер тратит то же время на проверку, а ответ не отличается от неверного пароля. Смена или сброс пароля завершает остальные сессии.
+- Письма (подтверждение почты, сброс пароля) уходят по SMTP в фоне, поэтому ответ на запрос сброса не выдаёт, зарегистрирована ли почта. В локальном окружении письма ловит Mailpit.
 
 ## 17. Наблюдаемость и SLO
 
@@ -1289,7 +1272,7 @@ WHERE project_id = {loadtest_project:UInt32};
 
 ### 19.3. Изоляция клиентов
 
-- `project_id` всегда берётся из ключа (collector) или из сессии с проверкой членства (api), никогда из тела запроса.
+- `project_id` всегда берётся из ключа (collector) или из пути запроса после проверки членства аккаунта из сессии (api), никогда из тела запроса.
 - Все запросы к ClickHouse параметризованы и содержат `project_id`. Тест в CI проверяет, что каждый запрос построителя содержит фильтр по проекту.
 - Для NL→SQL дополнительно — row policy в ClickHouse (раздел 14.2).
 
@@ -1302,6 +1285,16 @@ WHERE project_id = {loadtest_project:UInt32};
 ### 19.5. Защита от злоупотреблений
 
 Лимиты на проект (раздел 10.2), лимиты размера батча и события, защита от zip-бомб, лимиты на вход в дашборд по IP и аккаунту.
+
+Лимиты дашборда (фиксированное окно в Redis, при недоступности Redis запросы пропускаются):
+
+| Действие | Лимит |
+|---|---|
+| Вход | 20 попыток за 15 минут с IP, 10 — на одну почту (сюда же считается проверка текущего пароля при его смене) |
+| Регистрация | 10 в час с IP |
+| Вход через Telegram | 30 за 15 минут с IP |
+| Сброс пароля | 10 в час с IP, 3 в час на почту |
+| Повторное письмо подтверждения | 3 в час на аккаунт |
 
 ## 20. Режим прокси Bot API
 
@@ -1351,12 +1344,12 @@ WHERE project_id = {loadtest_project:UInt32};
 | Область | Технологии |
 |---|---|
 | SDK | Python 3.10+, aiogram 3, aiohttp |
-| Backend | Go 1.25+, `net/http` + chi, franz-go (Kafka), clickhouse-go v2, pgx, go-redis, prometheus/client_golang, OpenTelemetry, `log/slog` |
+| Backend | Go 1.26+, `net/http` + chi, franz-go (Kafka), clickhouse-go v2, pgx, go-redis, prometheus/client_golang, OpenTelemetry, `log/slog` |
 | Шина | Apache Kafka в режиме KRaft (в локальной разработке можно Redpanda) |
 | Хранилища | ClickHouse, PostgreSQL, Redis, Qdrant |
 | AI | Python, sentence-transformers, scikit-learn (HDBSCAN), LLM в РФ или своя через vLLM/Ollama |
 | Frontend | React, TypeScript, Vite, TanStack Query, React Router, ECharts |
-| Инфраструктура | Docker Compose (разработка и стенд), позже Kubernetes; GitHub Actions |
+| Инфраструктура | Docker Compose (разработка и стенд), Mailpit для писем в разработке, golang-migrate для миграций, позже Kubernetes; GitHub Actions |
 | Наблюдаемость | Prometheus, Grafana, OpenTelemetry |
 | Тестирование | pytest, `go test`, testcontainers, k6, toxiproxy, Playwright |
 
@@ -1379,8 +1372,15 @@ botsight/
 │   │   ├── kafka/
 │   │   ├── clickhouse/
 │   │   ├── query/              # построитель запросов: воронки, удержание, источники
-│   │   ├── ratelimit/
-│   │   └── auth/
+│   │   ├── ratelimit/          # лимиты в Redis
+│   │   ├── auth/               # пароли, API-ключи, подпись Telegram, токены
+│   │   ├── store/              # PostgreSQL: аккаунты, проекты, ключи, воронки, расходы
+│   │   ├── session/            # сессии дашборда в Redis
+│   │   ├── mail/               # письма по SMTP
+│   │   ├── httpapi/            # REST API дашборда
+│   │   ├── config/             # настройки из переменных окружения
+│   │   └── testenv/            # PostgreSQL и Redis в testcontainers для тестов
+│   ├── Dockerfile
 │   └── api/openapi.yaml
 ├── ai/                         # Python: эмбеддинги, темы, NL→SQL, аномалии
 ├── web/                        # React + TypeScript

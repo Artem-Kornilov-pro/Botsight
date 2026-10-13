@@ -1,0 +1,797 @@
+openapi: 3.1.0
+info:
+  title: Botsight API
+  version: 0.1.0
+  description: |
+    Control plane of the Botsight dashboard (Botsight.md, 13.3): accounts and sign-in,
+    projects, members, API keys, saved funnels and ad spend.
+
+    Authentication: the `bs_session` cookie (HttpOnly, SameSite=Lax) set on sign-in.
+    Every state-changing request of a signed-in user must send the `X-CSRF-Token`
+    header with `csrf_token` from the sign-in response or `GET /v1/account`.
+    Request bodies are JSON (`Content-Type: application/json`); unknown fields are rejected.
+
+    Roles in a project: `viewer` reads, `editor` also changes settings, funnels and
+    ad spend, `owner` also manages keys, members and deletes the project.
+    A project that the account is not a member of answers 404.
+servers:
+  - url: http://localhost:8080
+    description: deploy/docker-compose.yml
+
+tags:
+  - name: auth
+  - name: account
+  - name: projects
+  - name: members
+  - name: keys
+  - name: funnels
+  - name: ad-spend
+  - name: health
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness
+      security: []
+      responses:
+        "200": { description: The process is alive }
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness (PostgreSQL and Redis reachable, not shutting down)
+      security: []
+      responses:
+        "200": { description: Ready }
+        "503": { $ref: "#/components/responses/Error" }
+
+  /v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Register with email and password and sign in
+      description: Sends an email confirmation link. Limited per IP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email, maxLength: 254 }
+                password: { type: string, minLength: 8, maxLength: 128 }
+                name: { type: string, maxLength: 100 }
+      responses:
+        "201": { $ref: "#/components/responses/SignedIn" }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { description: "`email_taken`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Sign in with email and password
+      description: Limited per IP and per account. Unknown email and wrong password give the same answer.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/SignedIn" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { description: "`invalid_credentials`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/auth/telegram:
+    post:
+      tags: [auth]
+      summary: Sign in with the Telegram Login Widget
+      description: |
+        The body is the widget's data as received (`id`, `first_name`, `last_name`, `username`,
+        `photo_url`, `auth_date`, `hash`); every field takes part in the signature.
+        Creates an account on the first sign-in. Data older than 24 hours is rejected.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TelegramAuth" }
+      responses:
+        "200": { $ref: "#/components/responses/SignedIn" }
+        "401": { description: "`invalid_telegram_auth`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "`telegram_disabled`: TELEGRAM_BOT_TOKEN is not set", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/auth/password-reset:
+    post:
+      tags: [auth]
+      summary: Email a password reset link (valid 1 hour)
+      description: Always 202, whether or not the email is registered.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "202": { description: Accepted }
+        "400": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/auth/password-reset/confirm:
+    post:
+      tags: [auth]
+      summary: Set a new password with the token from the link
+      description: Ends every session of the account and confirms its email.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              additionalProperties: false
+              properties:
+                token: { type: string }
+                password: { type: string, minLength: 8, maxLength: 128 }
+      responses:
+        "204": { description: Password changed }
+        "400": { description: "`validation_failed` or `invalid_token`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/auth/verify-email:
+    post:
+      tags: [auth]
+      summary: Confirm the email with the token from the link (valid 48 hours)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              additionalProperties: false
+              properties:
+                token: { type: string }
+      responses:
+        "204": { description: Email confirmed }
+        "400": { description: "`invalid_token`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: End the current session
+      responses:
+        "204": { description: Signed out }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/account:
+    get:
+      tags: [account]
+      summary: The signed-in account and the CSRF token of the session
+      responses:
+        "200": { $ref: "#/components/responses/SignedIn" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    patch:
+      tags: [account]
+      summary: Change the display name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              additionalProperties: false
+              properties:
+                name: { type: string, maxLength: 100 }
+      responses:
+        "200": { description: Updated, content: { application/json: { schema: { $ref: "#/components/schemas/Account" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/account/password:
+    post:
+      tags: [account]
+      summary: Change the password; ends every other session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              additionalProperties: false
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8, maxLength: 128 }
+      responses:
+        "204": { description: Changed }
+        "400": { description: "`validation_failed` or `wrong_password`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "`no_password`: a Telegram-only account", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/account/verify-email:
+    post:
+      tags: [account]
+      summary: Send the email confirmation link again
+      responses:
+        "202": { description: Accepted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "`already_verified` or `no_email`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/account/telegram:
+    post:
+      tags: [account]
+      summary: Link a Telegram account to sign in with it too
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TelegramAuth" }
+      responses:
+        "200": { description: Linked, content: { application/json: { schema: { $ref: "#/components/schemas/Account" } } } }
+        "401": { description: "`unauthorized` or `invalid_telegram_auth`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`telegram_disabled`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "`telegram_taken`: linked to another account", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/account/sessions:
+    delete:
+      tags: [account]
+      summary: End every session except the current one
+      responses:
+        "204": { description: Done }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/projects:
+    get:
+      tags: [projects]
+      summary: Projects the account is a member of
+      responses:
+        "200":
+          description: Projects
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [projects]
+                properties:
+                  projects: { type: array, items: { $ref: "#/components/schemas/Project" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [projects]
+      summary: Create a project with its first API key
+      description: The creator becomes the owner. `api_key.key` is shown only in this response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              additionalProperties: false
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [project, api_key]
+                properties:
+                  project: { $ref: "#/components/schemas/Project" }
+                  api_key: { $ref: "#/components/schemas/NewAPIKey" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/projects/{projectID}:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [projects]
+      summary: A project (any member)
+      responses:
+        "200": { description: Project, content: { application/json: { schema: { $ref: "#/components/schemas/Project" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [projects]
+      summary: Rename and/or replace settings (editor)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              additionalProperties: false
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+                settings: { $ref: "#/components/schemas/ProjectSettings" }
+      responses:
+        "200": { description: Updated, content: { application/json: { schema: { $ref: "#/components/schemas/Project" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [projects]
+      summary: Delete the project and all its data (owner)
+      description: Active keys are announced as revoked to collectors.
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{projectID}/members:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [members]
+      summary: Members (any member)
+      responses:
+        "200":
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members: { type: array, items: { $ref: "#/components/schemas/Member" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [members]
+      summary: Add a registered account by email (owner)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/Role" }
+      responses:
+        "201": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/Member" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "`not_found` (project) or `account_not_found`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "`already_member`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/projects/{projectID}/members/{accountID}:
+    parameters:
+      - { $ref: "#/components/parameters/ProjectID" }
+      - { name: accountID, in: path, required: true, schema: { type: integer, format: int64, minimum: 1 } }
+    patch:
+      tags: [members]
+      summary: Change a role (owner)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              additionalProperties: false
+              properties:
+                role: { $ref: "#/components/schemas/Role" }
+      responses:
+        "200": { description: Changed, content: { application/json: { schema: { $ref: "#/components/schemas/Member" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/LastOwner" }
+    delete:
+      tags: [members]
+      summary: Remove a member (owner) or leave the project (yourself)
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/LastOwner" }
+
+  /v1/projects/{projectID}/keys:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [keys]
+      summary: API keys without secrets (any member)
+      responses:
+        "200":
+          description: Keys
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys: { type: array, items: { $ref: "#/components/schemas/APIKey" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [keys]
+      summary: Create a key (owner); the body is optional
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string, maxLength: 100 }
+      responses:
+        "201": { description: Created; `key` is shown only here, content: { application/json: { schema: { $ref: "#/components/schemas/NewAPIKey" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/projects/{projectID}/keys/{keyID}:
+    parameters:
+      - { $ref: "#/components/parameters/ProjectID" }
+      - { name: keyID, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    delete:
+      tags: [keys]
+      summary: Revoke a key (owner); repeating is a no-op
+      description: The prefix is published to Redis `keys:revoked` for collectors.
+      responses:
+        "204": { description: Revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{projectID}/funnels:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [funnels]
+      summary: Saved funnels (any member)
+      responses:
+        "200":
+          description: Funnels
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [funnels]
+                properties:
+                  funnels: { type: array, items: { $ref: "#/components/schemas/Funnel" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [funnels]
+      summary: Save a funnel (editor)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FunnelInput" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Funnel" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/projects/{projectID}/funnels/{funnelID}:
+    parameters:
+      - { $ref: "#/components/parameters/ProjectID" }
+      - { name: funnelID, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    get:
+      tags: [funnels]
+      summary: A funnel (any member)
+      responses:
+        "200": { description: Funnel, content: { application/json: { schema: { $ref: "#/components/schemas/Funnel" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [funnels]
+      summary: Replace a funnel (editor)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FunnelInput" }
+      responses:
+        "200": { description: Updated, content: { application/json: { schema: { $ref: "#/components/schemas/Funnel" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [funnels]
+      summary: Delete a funnel (editor)
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{projectID}/ad-spend:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [ad-spend]
+      summary: Ad spend whose period intersects [from, to] (any member)
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: Spend
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ad_spend]
+                properties:
+                  ad_spend: { type: array, items: { $ref: "#/components/schemas/AdSpend" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [ad-spend]
+      summary: Add spend on a source over whole days (editor)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, from, to, amount_rub]
+              additionalProperties: false
+              properties:
+                source: { type: string, pattern: "^[A-Za-z0-9_-]{1,64}$", description: Deep link label }
+                from: { type: string, format: date }
+                to: { type: string, format: date, description: Inclusive; at most 366 days after from }
+                amount_rub: { type: number, minimum: 0, multipleOf: 0.01 }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/AdSpend" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "`period_overlap`: the source already has spend on some of these days", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/projects/{projectID}/ad-spend/{spendID}:
+    parameters:
+      - { $ref: "#/components/parameters/ProjectID" }
+      - { name: spendID, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    delete:
+      tags: [ad-spend]
+      summary: Delete spend (editor)
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+security:
+  - session: []
+
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: bs_session
+
+  parameters:
+    ProjectID:
+      name: projectID
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+
+  responses:
+    SignedIn:
+      description: The account and the CSRF token; sign-in endpoints also set the `bs_session` cookie
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [account, csrf_token]
+            properties:
+              account: { $ref: "#/components/schemas/Account" }
+              csrf_token: { type: string, description: Send in X-CSRF-Token on state-changing requests }
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: "`unauthorized`: no session or it expired"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: "`csrf_failed` or `forbidden` (role too low)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: "`not_found`; also for projects the account is not a member of"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    LastOwner:
+      description: "`last_owner`: a project must keep at least one owner"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: "`rate_limited`; see Retry-After"
+      headers:
+        Retry-After: { schema: { type: integer }, description: Seconds to wait }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine code; the dashboard maps it to a message
+              enum: [invalid_json, validation_failed, unsupported_media_type, unauthorized, csrf_failed, forbidden,
+                     not_found, method_not_allowed, rate_limited, internal, unavailable, email_taken,
+                     invalid_credentials, wrong_password, no_password, no_email, already_verified, invalid_token,
+                     telegram_disabled, invalid_telegram_auth, telegram_taken, account_not_found, already_member,
+                     last_owner, period_overlap]
+            message: { type: string }
+            field: { type: string, description: The invalid field for validation_failed }
+
+    Account:
+      type: object
+      required: [id, email, email_verified, has_password, telegram, name, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: [string, "null"], format: email }
+        email_verified: { type: boolean }
+        has_password: { type: boolean }
+        telegram:
+          type: [object, "null"]
+          required: [id, username]
+          properties:
+            id: { type: integer, format: int64 }
+            username: { type: [string, "null"] }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    TelegramAuth:
+      type: object
+      required: [id, auth_date, hash]
+      additionalProperties: { type: [string, number] }
+      properties:
+        id: { type: integer, format: int64 }
+        first_name: { type: string }
+        last_name: { type: string }
+        username: { type: string }
+        photo_url: { type: string }
+        auth_date: { type: integer, description: Unix time }
+        hash: { type: string }
+
+    Role:
+      type: string
+      enum: [owner, editor, viewer]
+
+    ProjectSettings:
+      type: object
+      required: [capture_text, neutral_handlers]
+      additionalProperties: false
+      properties:
+        capture_text: { type: boolean, description: Accept message texts for AI topics (Botsight.md, 14) }
+        neutral_handlers:
+          type: array
+          maxItems: 100
+          description: Handlers ('module:qualname') that do not count as a retry on a step (Botsight.md, 13.1)
+          items: { type: string, maxLength: 200 }
+
+    Project:
+      type: object
+      required: [id, name, bot_id, plan, settings, role, created_at]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        bot_id: { type: [integer, "null"], format: int64, description: Filled by the first event }
+        plan: { type: string }
+        settings: { $ref: "#/components/schemas/ProjectSettings" }
+        role: { $ref: "#/components/schemas/Role" }
+        created_at: { type: string, format: date-time }
+
+    Member:
+      type: object
+      required: [account_id, email, telegram_username, name, role, added_at]
+      properties:
+        account_id: { type: integer, format: int64 }
+        email: { type: [string, "null"] }
+        telegram_username: { type: [string, "null"] }
+        name: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        added_at: { type: string, format: date-time }
+
+    APIKey:
+      type: object
+      required: [id, prefix, name, created_at, revoked_at]
+      properties:
+        id: { type: integer }
+        prefix: { type: string, example: bs_live_ab12cd34 }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: [string, "null"], format: date-time }
+
+    NewAPIKey:
+      allOf:
+        - $ref: "#/components/schemas/APIKey"
+        - type: object
+          required: [key]
+          properties:
+            key: { type: string, description: The full key; shown once, store it in BOTSIGHT_KEY }
+
+    FunnelStep:
+      type: object
+      required: [kind, value]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [command, callback_data, state, custom] }
+        value: { type: string, minLength: 1, maxLength: 256, description: "Command without '/', callback_data, FSM state or manual event name" }
+
+    FunnelDefinition:
+      type: object
+      required: [steps]
+      additionalProperties: false
+      properties:
+        steps: { type: array, minItems: 2, maxItems: 20, items: { $ref: "#/components/schemas/FunnelStep" } }
+        window_seconds: { type: integer, minimum: 60, maximum: 2592000, default: 86400 }
+        breakdown: { type: string, enum: ["", source], default: "" }
+
+    FunnelInput:
+      type: object
+      required: [name, definition]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        definition: { $ref: "#/components/schemas/FunnelDefinition" }
+
+    Funnel:
+      type: object
+      required: [id, name, definition, created_at, updated_at]
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        definition: { $ref: "#/components/schemas/FunnelDefinition" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AdSpend:
+      type: object
+      required: [id, source, from, to, amount_rub, created_at]
+      properties:
+        id: { type: integer }
+        source: { type: string }
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        amount_rub: { type: number }
+        created_at: { type: string, format: date-time }
