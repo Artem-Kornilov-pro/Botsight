@@ -340,3 +340,31 @@ func (s *Store) KeyByPrefix(ctx context.Context, prefix string) (APIKey, error) 
 		Scan(&k.ID, &k.ProjectID, &k.Prefix, &k.Name, &k.CreatedBy, &k.CreatedAt, &k.RevokedAt, &k.secretHash)
 	return k, mapErr(err)
 }
+
+// IngestKey is what the collector needs to accept a batch: the key and its project.
+type IngestKey struct {
+	ProjectID   int32
+	SecretHash  []byte
+	Revoked     bool
+	CaptureText bool
+	BotIDKnown  bool
+}
+
+// IngestKeyByPrefix loads a key with the project settings the collector caches.
+func (s *Store) IngestKeyByPrefix(ctx context.Context, prefix string) (IngestKey, error) {
+	var k IngestKey
+	err := s.pool.QueryRow(ctx,
+		`SELECT k.project_id, k.secret_hash, k.revoked_at IS NOT NULL,
+		        COALESCE((p.settings->>'capture_text')::boolean, false), p.bot_id IS NOT NULL
+		 FROM api_keys k JOIN projects p ON p.id = k.project_id
+		 WHERE k.prefix = $1`, prefix).
+		Scan(&k.ProjectID, &k.SecretHash, &k.Revoked, &k.CaptureText, &k.BotIDKnown)
+	return k, mapErr(err)
+}
+
+// SetProjectBotID records the bot of a project from its first event (Botsight.md, 12.4).
+func (s *Store) SetProjectBotID(ctx context.Context, projectID int32, botID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE projects SET bot_id = $2 WHERE id = $1 AND bot_id IS NULL`, projectID, botID)
+	return mapErr(err)
+}

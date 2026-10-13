@@ -614,62 +614,74 @@ Content-Type: application/json
 Content-Encoding: gzip
 ```
 
-Ограничения: до 500 событий, до 2 МиБ после распаковки, одно событие до 16 КиБ, события не старше 7 дней.
+Ограничения: до 500 событий, до 2 МиБ после распаковки, одно событие до 16 КиБ, события не старше 7 дней. `Content-Encoding` — `gzip` или без сжатия.
 
 Ответ `202 Accepted`:
 
 ```json
-{ "accepted": 500, "duplicate": false }
+{ "accepted": 498, "duplicate": false, "rejected": 2 }
 ```
+
+`rejected` — события, не прошедшие проверку (неверный `event_id`, неизвестный `type`, старше 7 дней и т. п.). Они отбрасываются по одному, остальной батч принимается. Для повтора уже принятого батча `accepted` — число событий из первого приёма, `duplicate: true`.
 
 ### 10.2. Обработка запроса
 
 1. **TLS** завершается на балансировщике.
-2. **Аутентификация.** Ключ имеет вид `bs_live_<префикс 8 символов>_<секрет>`. По префиксу проект ищется в LRU-кэше в памяти (TTL 60 с), при промахе — в PostgreSQL. Сравнивается SHA-256 полного ключа через `subtle.ConstantTimeCompare`. Отзыв ключа рассылается всем инстансам через Redis Pub/Sub и сразу сбрасывает кэш.
-3. **Распаковка с лимитом.** `gzip.Reader` берётся из `sync.Pool` и оборачивается в `io.LimitReader` на 2 МиБ: защита от zip-бомб.
-4. **Дедупликация батча** (подробно в 10.4).
-5. **Лимит приёма.** Один вызов Lua-скрипта в Redis на батч забирает из токен-бакета проекта столько токенов, сколько событий в батче. Не хватает токенов — `429` с `Retry-After`.
-6. **Валидация и нормализация.** Проверка обязательных полей и типов, обрезка строк до лимитов. Сервер ставит `received_at`. Если часы бота расходятся с сервером больше чем на 24 часа, `ts` заменяется на `received_at` с флагом `clock_skewed`.
-7. **Разделение.** Тексты уходят в `messages.text`, остальное — в `events.raw`. `project_id` берётся только из ключа.
-8. **Запись в Kafka.** Асинхронная отправка всех записей батча, затем ожидание подтверждения каждой (`acks=all`, идемпотентный продюсер).
-9. **Ответ** `202` — только после подтверждения Kafka. Если Kafka недоступна — `503`, и SDK повторит отправку.
+2. **Защита от перегрузки.** Инстанс обрабатывает не больше `INGEST_MAX_INFLIGHT` батчей одновременно (по умолчанию 512). Сверх этого — сразу `503` с кодом `overloaded` и `Retry-After: 1`, без очереди в памяти.
+3. **Аутентификация.** Ключ имеет вид `bs_live_<префикс 8 символов>_<секрет>`. По префиксу ключ и настройки проекта ищутся в кэше в памяти (TTL 60 с), при промахе — в PostgreSQL. Одновременные промахи по одному префиксу дают один запрос к базе (singleflight). Несуществующие префиксы кэшируются на 10 секунд, чтобы случайные ключи не нагружали базу. Сравнивается SHA-256 полного ключа через `subtle.ConstantTimeCompare`. Отзыв ключа рассылается всем инстансам через Redis Pub/Sub и сразу сбрасывает кэш.
+4. **Распаковка с лимитом.** `gzip.Reader` и буферы берутся из `sync.Pool`, распакованные данные читаются через `io.LimitReader` на 2 МиБ: zip-бомба останавливается на 2 МиБ.
+5. **Дедупликация и лимит приёма** — один Lua-скрипт в Redis на батч (10.4).
+6. **Валидация и нормализация** каждого события. Обрезка строк до лимитов, сервер ставит `received_at`. Расхождение часов определяется по `sent_at` батча: если часы бота расходятся с сервером больше чем на 24 часа, у всех событий батча `ts` заменяется на `received_at` с флагом `clock_skewed`. При нормальных часах события старше 7 дней отбрасываются.
+7. **Разделение.** Тексты уходят в `messages.text`, только если у проекта включён `capture_text`. Если сбор текстов выключен, сервер отбрасывает текст, даже если SDK его прислал. Остальное идёт в `events.raw`, метаданные батча (версии SDK, `dropped`, число отклонённых событий) — в `ingest.batches`. `project_id` берётся только из ключа.
+8. **Запись в Kafka.** Все записи батча отправляются вместе, затем — ожидание подтверждения каждой (`acks=all`, идемпотентный продюсер). Контекст отправки не зависит от соединения клиента: если клиент отключился, батч всё равно дописывается до конца.
+9. **Ответ** `202` — только после подтверждения Kafka. Если Kafka недоступна — `503`, ключ батча удаляется, и повтор SDK обрабатывается заново.
+10. **`projects.bot_id`** заполняется в фоне по первому принятому событию.
 
 ### 10.3. Коды ответов
 
 | Код | Когда |
 |---|---|
 | 202 | батч принят или уже был принят ранее (`"duplicate": true`) |
-| 400 | неверный JSON или схема |
-| 401 | неверный или отозванный ключ |
+| 400 | неверный JSON, схема, `schema_version` или повреждённый gzip |
+| 401 | нет ключа, неверный или отозванный ключ |
 | 409 | батч с таким `batch_id` сейчас обрабатывается другим запросом |
-| 413 | превышен размер |
-| 429 | превышен лимит проекта |
-| 503 | Kafka недоступна или идёт остановка инстанса |
+| 413 | больше 2 МиБ после распаковки |
+| 415 | неподдерживаемый `Content-Encoding` |
+| 429 | превышен лимит проекта, есть `Retry-After` |
+| 503 | Kafka или Redis недоступны, промах кэша ключей при недоступном PostgreSQL, перегрузка инстанса (`overloaded`), остановка. Всегда с `Retry-After` |
+
+Ошибки — `{"error": {"code", "message"}}`.
 
 ### 10.4. Дедупликация батчей
 
-SDK может отправить батч повторно, если не дождался ответа, хотя сервер его уже принял. Дедупликация идёт по батчу, а не по каждому событию: одна операция Redis на запрос.
+SDK может отправить батч повторно, если не дождался ответа, хотя сервер его уже принял. Дедупликация идёт по батчу, а не по каждому событию. Вместе с лимитом приёма это один Lua-скрипт: один запрос в Redis на батч.
 
 ```
-SET batch:{project_id}:{batch_id} processing NX EX 120
-  ├─ ключ создан    → обработка → успех: SET ... done EX 86400 → 202
-  │                              → ошибка Kafka: DEL ...      → 503
-  └─ ключ уже есть  → значение done        → 202, duplicate: true
-                    → значение processing  → 409, SDK повторит позже
+EVAL admit  KEYS: batch:{project_id}:{batch_id}, rl:{project_id}
+  ├─ ключ батча есть   → done:<N>    → 202, duplicate: true, accepted: N
+  │                    → processing  → 409, SDK повторит позже
+  ├─ не хватает токенов → 429, Retry-After по скорости пополнения бакета
+  └─ иначе: списать токены, SET batch:... processing EX 120
+        → обработка → успех: SET batch:... done:<N> EX 86400 → 202
+                    → ошибка Kafka: DEL batch:...           → 503
 ```
 
 Состояние `processing` нужно, чтобы не потерять батч: если бы второй запрос сразу получил `202`, а первый упал на записи в Kafka, события пропали бы.
+
+Токен-бакет — на проект (`INGEST_RATE` событий в секунду, запас `INGEST_BURST`; по умолчанию 2000 и 20 000), время берётся из Redis (`TIME`), поэтому часы инстансов collector не влияют. Шумный клиент упирается в свой лимит и не забирает пропускную способность у остальных. Ключи `batch:{42}:...` и `rl:{42}` содержат одинаковый hash tag `{42}` и попадают в один слот Redis Cluster, так что скрипт будет работать и в кластере.
 
 ### 10.5. Производительность
 
 - Буферы и `gzip.Reader` переиспользуются через `sync.Pool`.
 - В MVP JSON декодируется стандартной библиотекой. Затем профилирование через `pprof` и сравнение с кодогенерацией или потоковым парсером. В v1 — переход на Protobuf + zstd с замером выигрыша.
 - Один запрос в Redis на батч (лимит и дедупликация), ни одного запроса к PostgreSQL на горячем пути.
+- Записи всех одновременных запросов собираются продюсером в общие пачки (`linger` 5 мс, zstd), поэтому число запросов к Kafka растёт медленнее числа батчей.
+- Первый замер — в разделе 18.2.
 - Начиная с Go 1.25 `GOMAXPROCS` по умолчанию учитывает CPU-лимиты cgroup в контейнере.
 
 ### 10.6. Остановка без потерь
 
-По `SIGTERM` инстанс переключает readiness-пробу в «не готов», балансировщик перестаёт слать новые запросы, текущие запросы дорабатывают, продюсер Kafka досылает буфер (`Flush`), затем процесс завершается.
+По `SIGTERM` инстанс переключает readiness-пробу в «не готов» и 2 секунды ждёт, пока балансировщик это заметит. Затем текущие запросы дорабатывают (каждый ждёт подтверждения Kafka), продюсер досылает буфер (`Flush`), и процесс завершается.
 
 ## 11. Конвейер данных: Kafka и ClickHouse
 
@@ -679,23 +691,29 @@ SET batch:{project_id}:{batch_id} processing NX EX 120
 |---|---|---|---|---|
 | `events.raw` | `project_id:user_id` | 24 | 72 ч | все события без текстов |
 | `messages.text` | `project_id:user_id` | 12 | 24 ч | тексты, только проекты с `capture_text` |
-| `events.dlq` | — | 3 | 7 дней | записи, которые не удалось обработать |
-| `alerts` | `project_id` | 3 | 7 дней | аномалии и срабатывания антифрода |
+| `ingest.batches` | `project_id` | 6 | 72 ч | метаданные принятых батчей: версии SDK, `dropped`, отклонённые события |
+| `events.dlq` | исходный | 3 | 7 дней | записи, которые не удалось обработать, с заголовками исходного топика, партиции, смещения и ошибки |
+| `alerts` | `project_id` | 3 | 7 дней | аномалии и срабатывания антифрода (появится вместе с antifraud) |
+
+Топики создаёт `internal/kafka` при старте collector и ch-writer (`KAFKA_CREATE_TOPICS`), автосоздание в брокере выключено. Существующие топики не меняются: число партиций и срок хранения в продакшене меняют осознанно. Значение записи — JSON нормализованного события (`internal/event`).
+
+У событий без пользователя (исходящие запросы, `user_id = 0`) ключ — `project_id:chat_id`: в личном чате это тот же пользователь, и его события остаются в одной партиции.
 
 **Почему ключ `project_id:user_id`, а не `project_id`.** Ключ по проекту дал бы горячую партицию у крупного клиента. Ключ по пользователю распределяет нагрузку равномерно и сохраняет порядок событий одного пользователя внутри партиции. Это нужно `antifraud`, который считает окна по пользователю в памяти.
 
-Настройки продюсера (franz-go): `acks=all`, идемпотентность (по умолчанию в franz-go), сжатие zstd, `linger` 5 мс. Настройки топиков: `replication.factor=3`, `min.insync.replicas=2` в продакшене, 1 реплика в локальном окружении. В заголовках записи передаются `trace_id`, `schema_version` и `project_id`.
+Настройки продюсера (franz-go): `acks=all`, идемпотентность (по умолчанию в franz-go), сжатие zstd, `linger` 5 мс, таймаут доставки записи 10 с. Настройки топиков: `replication.factor=3`, `min.insync.replicas=2` в продакшене, 1 реплика в локальном окружении. В заголовках записи передаются `schema_version` и `project_id`; `trace_id` добавится вместе с OpenTelemetry.
 
 ### 11.2. ch-writer
 
 Отдельный сервис вместо встроенного движка Kafka в ClickHouse. Причины: контроль размера пачек, дедупликация, DLQ и метрики. Встроенный движок используется как эталон для сравнения в бенчмарке.
 
-1. Читает свои партиции в consumer group.
-2. Копит пачку по каждой партиции: 50 000 строк или 1 секунда.
-3. Перекладывает события в колонки и вставляет через нативный протокол (`clickhouse-go`: `PrepareBatch` → `Append` → `Send`).
+1. Читает топики `events.raw`, `messages.text` и `ingest.batches` в consumer group `ch-writer`. Каждой назначенной партиции — своя горутина.
+2. Копит пачку по каждой партиции: 50 000 строк или 1 секунда (`CHWRITER_BATCH_ROWS`, `CHWRITER_FLUSH_INTERVAL`).
+3. Перекладывает записи в колонки и вставляет через нативный протокол со сжатием LZ4 (`clickhouse-go`: `PrepareBatch` → `Append` → `Send`).
 4. Фиксирует смещение в Kafka только после успешной вставки.
 5. Записи, которые не удалось разобрать, уходят в `events.dlq` и не блокируют партицию.
-6. Если ClickHouse недоступен — ретраи с задержкой и пауза чтения партиции (`PauseFetchPartitions`). Растёт лаг, срабатывает алерт, данные ждут в Kafka.
+6. Если ClickHouse недоступен — ретраи с экспоненциальной задержкой до 30 секунд и пауза чтения партиции (`PauseFetchPartitions`). Чтение тоже встаёт на паузу, если в буфере партиции больше 4 пачек. Растёт лаг (`botsight_consumer_lag`), данные ждут в Kafka, память не растёт.
+7. При отзыве партиции (ребаланс) горутина дожидается текущей вставки и фиксации и останавливается, буфер без фиксации отбрасывается — новый владелец прочитает его сам. По `SIGTERM` буферы дописываются (до 10 секунд), смещения фиксируются, затем инстанс выходит из группы.
 
 ### 11.3. Дубли при падении ch-writer
 
@@ -703,9 +721,10 @@ SET batch:{project_id}:{batch_id} processing NX EX 120
 
 Решение — токен дедупликации вставки ClickHouse:
 
-- Каждая вставка выполняется с настройкой `insert_deduplication_token = "events.raw/p{partition}/{first_offset}-{last_offset}"`. ClickHouse отбрасывает повторную вставку блока с тем же токеном (для нереплицированной таблицы нужна настройка `non_replicated_deduplication_window`).
-- Токен работает, только если после рестарта пачка соберётся с **теми же границами**. Поэтому перед вставкой ch-writer сохраняет план `writer:plan:{partition} = last_offset` в Redis. После рестарта первая пачка каждой партиции собирается ровно до сохранённого `last_offset`.
-- Для материализованных представлений включается `deduplicate_blocks_in_dependent_materialized_views = 1`, иначе агрегаты посчитают дубль.
+- Каждая вставка выполняется с настройкой `insert_deduplication_token = "{topic}/p{partition}/{first_offset}-{last_offset}"`. ClickHouse отбрасывает повторную вставку блока с тем же токеном (для нереплицированной таблицы нужна настройка `non_replicated_deduplication_window`).
+- Токен работает, только если после рестарта пачка соберётся с **теми же границами**. Поэтому перед вставкой ch-writer сохраняет план `writer:plan:{topic}:{partition} = first-last` в Redis. Если после рестарта (или на другом инстансе после ребаланса) чтение партиции начинается ровно с `first`, первая пачка собирается ровно до `last`. Если смещения ушли вперёд, план не нужен и игнорируется.
+- Для материализованных представлений включается `deduplicate_blocks_in_dependent_materialized_views = 1`, а у целевых таблиц агрегатов (`events_daily`, `user_first_start`) тоже задаётся `non_replicated_deduplication_window`: повтор отбрасывается средствами целевой таблицы, иначе агрегаты посчитают дубль.
+- Проверено тестом `TestCrashBetweenInsertAndCommit`: ch-writer «падает» после вставки, до фиксации смещения, новый экземпляр дочитывает партиции. В `events` и в `events_daily` ровно по одной копии каждого события.
 
 ### 11.4. Итоговая семантика доставки
 
@@ -717,7 +736,9 @@ SET batch:{project_id}:{batch_id} processing NX EX 120
 | Kafka → ClickHouse | at-least-once, дубли отсекаются | токен вставки, детерминированные границы пачек |
 | **Итого** | **каждое принятое событие ровно один раз в ClickHouse** | проверяется сверкой в хаос-тестах (раздел 18) |
 
-Единственные допустимые потери — события, выброшенные SDK при переполнении очереди. Они учитываются в счётчике `dropped`.
+Единственные допустимые потери — события, выброшенные SDK при переполнении очереди. Они учитываются в счётчике `dropped` и попадают в таблицу `ingest_batches`.
+
+Известное ограничение: если Kafka подтвердила только часть записей батча и collector ответил `503`, повтор SDK запишет подтверждённые события второй раз. Это редкий случай частичного сбоя брокера. Закрыть его можно транзакционным продюсером (батч записывается атомарно, ch-writer читает с `read_committed`) — ценой задержки и сложности. Решение отложено до замеров на стенде.
 
 ## 12. Хранилища и схемы
 
@@ -731,6 +752,7 @@ CREATE TABLE events
     event_id       UUID,
     ts             DateTime64(3, 'UTC'),
     received_at    DateTime64(3, 'UTC'),
+    clock_skewed   UInt8,                    -- ts заменён на received_at (10.2)
     type           LowCardinality(String),   -- update | step | outgoing | custom | lifecycle
     name           LowCardinality(String),
     user_id        UInt64,
@@ -744,6 +766,7 @@ CREATE TABLE events
     handler        LowCardinality(String),
     state_from     LowCardinality(String),
     state_to       LowCardinality(String),
+    member_status  LowCardinality(String),   -- my_chat_member: kicked = блокировка в личном чате
     handled        UInt8,
     ok             UInt8,
     duration_ms    UInt32,
@@ -770,6 +793,10 @@ SETTINGS non_replicated_deduplication_window = 1000;
 - **Две карты свойств** (`props_str`, `props_num`): по числам можно считать `sum`, `avg`, `quantile` без приведения типов.
 - Пустые значения хранятся как `''` и `0`, без `Nullable`: так быстрее.
 
+Схема ClickHouse — в миграциях [`migrations/clickhouse/`](migrations/clickhouse/), их применяет контейнер `migrate-clickhouse` (golang-migrate). Первый замер на 6 млн событий нагрузочного генератора: около 23 байт на событие после сжатия, в 4,3 раза меньше несжатых данных.
+
+Метаданные батчей — отдельная таблица `ingest_batches` (`project_id`, `batch_id`, `received_at`, версии SDK и фреймворка, `events`, `rejected`, `dropped`). По ней дашборд покажет потери в SDK и версии SDK у клиентов.
+
 ### 12.2. ClickHouse: тексты
 
 ```sql
@@ -787,8 +814,10 @@ CREATE TABLE messages_text
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (project_id, ts)
-TTL toDateTime(ts) + INTERVAL 30 DAY;
+TTL toDateTime(ts) + INTERVAL 30 DAY
+SETTINGS non_replicated_deduplication_window = 1000;
 
+-- появится вместе с ai-worker
 CREATE TABLE message_topics
 (
     project_id   UInt32,
@@ -818,7 +847,8 @@ CREATE TABLE events_daily
     users       AggregateFunction(uniqCombined, UInt64)
 )
 ENGINE = AggregatingMergeTree
-ORDER BY (project_id, bot_id, day, type, name);
+ORDER BY (project_id, bot_id, day, type, name)
+SETTINGS non_replicated_deduplication_window = 1000;   -- 11.3
 
 CREATE MATERIALIZED VIEW events_daily_mv TO events_daily AS
 SELECT
@@ -842,7 +872,8 @@ CREATE TABLE user_first_start
     source       AggregateFunction(argMin, String, DateTime64(3, 'UTC'))
 )
 ENGINE = AggregatingMergeTree
-ORDER BY (project_id, user_id);
+ORDER BY (project_id, user_id)
+SETTINGS non_replicated_deduplication_window = 1000;
 
 CREATE MATERIALIZED VIEW user_first_start_mv TO user_first_start AS
 SELECT project_id, user_id, min(ts) AS first_start, argMinState(start_param, ts) AS source
@@ -1172,10 +1203,12 @@ Grafana и Prometheus — для мониторинга самого Botsight. �
 
 | Сервис | Метрики |
 |---|---|
-| collector | `botsight_ingest_requests_total{code}`, `botsight_ingest_events_total`, `botsight_ingest_duration_seconds` (гистограмма), `botsight_kafka_produce_errors_total`, `botsight_ratelimited_total`, `botsight_batch_duplicates_total` |
-| ch-writer | лаг consumer group по партициям, `botsight_ch_insert_rows_total`, `botsight_ch_insert_duration_seconds`, `botsight_dlq_total` |
+| collector | `botsight_ingest_requests_total{code}`, `botsight_ingest_events_total{result}`, `botsight_ingest_duration_seconds` (гистограмма), `botsight_kafka_produce_errors_total`, `botsight_ratelimited_total`, `botsight_batch_duplicates_total`, `botsight_ingest_overloaded_total`, `botsight_key_cache_total{result}` |
+| ch-writer | `botsight_consumer_lag{topic,partition}`, `botsight_ch_insert_rows_total{table}`, `botsight_ch_insert_duration_seconds{table}`, `botsight_ch_insert_errors_total{table}`, `botsight_dlq_total{topic}`, `botsight_ch_paused_partitions` |
 | api | `http_request_duration_seconds{route}`, `botsight_query_duration_seconds{kind}`, доля попаданий в кэш |
-| SDK (через батчи) | выброшенные события, ретраи, версии SDK и фреймворков — в ClickHouse |
+| SDK (через батчи) | выброшенные события и версии SDK и фреймворков — в таблице `ingest_batches` ClickHouse |
+
+collector отдаёт метрики на `:8081/metrics`, ch-writer — на `:8082/metrics`.
 
 В метках Prometheus нет `project_id`: тысячи проектов дали бы взрыв кардинальности. Потребление по проектам считается в ClickHouse.
 
@@ -1218,6 +1251,19 @@ Grafana и Prometheus — для мониторинга самого Botsight. �
 | Сквозная пропускная способность стенда | ≥ 200 000 событий/с |
 | p99 приёма при 70 % от пиковой нагрузки | < 50 мс |
 | Свежесть данных | p95 < 10 с |
+
+Первый замер (`cmd/loadgen`, docker compose на одном ноутбуке: Apple M5, 10 ядер, 8 ГБ памяти Docker; все сервисы, Kafka с одним брокером, ClickHouse и генератор нагрузки на одной машине; один инстанс collector и один ch-writer):
+
+| Показатель | Результат |
+|---|---|
+| Приём, 50 проектов × 2000 пользователей, 64 параллельных отправителя, 30 с | 196 000 событий/с (5,9 млн событий, все ответы 202) |
+| Задержка ответа collector в насыщении | p50 140 мс, p99 357 мс — запросы стоят в очереди за общим CPU; при нагрузке ниже пика p50 7 мс |
+| ch-writer | успевал за приёмом: всё в ClickHouse через 2 с после конца нагрузки |
+| Сверка | строк в ClickHouse = событий в журнале loadgen = принятых, дублей 0 (2 % батчей отправлялись повторно) |
+| Свежесть с Python SDK | 1,2 с от отправки до видимости в ClickHouse |
+| Лимит проекта | при 2000 событий/с на проект collector отвечает `429`, другие проекты не затронуты |
+
+Это верхняя оценка одной машины, а не стенда: генератор и все сервисы делят одни и те же ядра. Цели раздела проверяются на стенде с отдельными машинами для генератора, Kafka и ClickHouse.
 
 ### 18.3. Хаос-тесты
 
@@ -1345,8 +1391,8 @@ WHERE project_id = {loadtest_project:UInt32};
 |---|---|
 | SDK | Python 3.10+, aiogram 3, aiohttp |
 | Backend | Go 1.26+, `net/http` + chi, franz-go (Kafka), clickhouse-go v2, pgx, go-redis, prometheus/client_golang, OpenTelemetry, `log/slog` |
-| Шина | Apache Kafka в режиме KRaft (в локальной разработке можно Redpanda) |
-| Хранилища | ClickHouse, PostgreSQL, Redis, Qdrant |
+| Шина | Apache Kafka 4 в режиме KRaft (образ `apache/kafka`, тот же в docker compose и в тестах) |
+| Хранилища | ClickHouse 25.8, PostgreSQL 17, Redis 7, Qdrant |
 | AI | Python, sentence-transformers, scikit-learn (HDBSCAN), LLM в РФ или своя через vLLM/Ollama |
 | Frontend | React, TypeScript, Vite, TanStack Query, React Router, ECharts |
 | Инфраструктура | Docker Compose (разработка и стенд), Mailpit для писем в разработке, golang-migrate для миграций, позже Kubernetes; GitHub Actions |
@@ -1365,12 +1411,13 @@ botsight/
 │   │   ├── chwriter/           # Kafka → ClickHouse
 │   │   ├── api/                # REST для дашборда, auth, проекты
 │   │   ├── antifraud/          # стриминговые признаки и скоринг
-│   │   └── loadgen/            # симулятор ботов
+│   │   └── loadgen/            # генератор нагрузки в формате SDK
 │   ├── internal/
-│   │   ├── event/              # схема событий и валидация
-│   │   ├── ingest/             # обработка батчей
-│   │   ├── kafka/
-│   │   ├── clickhouse/
+│   │   ├── event/              # контракт событий: разбор батча, проверка, записи Kafka
+│   │   ├── ingest/             # collector: ключи, дедупликация и лимит, запись в Kafka
+│   │   ├── chwriter/           # Kafka → ClickHouse: пачки, токен дедупликации, DLQ
+│   │   ├── kafka/              # топики и настройки продюсера
+│   │   ├── clickhouse/         # подключение к ClickHouse
 │   │   ├── query/              # построитель запросов: воронки, удержание, источники
 │   │   ├── ratelimit/          # лимиты в Redis
 │   │   ├── auth/               # пароли, API-ключи, подпись Telegram, токены
@@ -1379,7 +1426,7 @@ botsight/
 │   │   ├── mail/               # письма по SMTP
 │   │   ├── httpapi/            # REST API дашборда
 │   │   ├── config/             # настройки из переменных окружения
-│   │   └── testenv/            # PostgreSQL и Redis в testcontainers для тестов
+│   │   └── testenv/            # PostgreSQL, Redis, Kafka и ClickHouse в testcontainers
 │   ├── Dockerfile
 │   └── api/openapi.yaml
 ├── ai/                         # Python: эмбеддинги, темы, NL→SQL, аномалии

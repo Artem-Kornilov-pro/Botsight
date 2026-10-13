@@ -1,6 +1,11 @@
 # Local environment: docker compose -f deploy/docker-compose.yml up --build
-#   api      http://localhost:8080
-#   Mailpit  http://localhost:8025 (emails sent by the api)
+#   api         http://localhost:8080
+#   collector   http://localhost:8081  (POST /v1/batch from the SDK, /metrics)
+#   ch-writer   http://localhost:8082  (/readyz, /metrics)
+#   Mailpit     http://localhost:8025  (emails sent by the api)
+#   ClickHouse  http://localhost:8123  (user and password: botsight)
+#   Kafka       localhost:9094
+# Data path: SDK -> collector -> Kafka -> ch-writer -> ClickHouse (Botsight.md, 7.3).
 name: botsight
 
 services:
@@ -36,6 +41,51 @@ services:
       - "127.0.0.1:8025:8025" # web UI
       - "127.0.0.1:1025:1025" # SMTP
 
+  kafka:
+    image: apache/kafka:4.1.0
+    environment:
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: BROKER://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: BROKER://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: BROKER:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # topics come from internal/kafka with their partitions
+    ports:
+      - "127.0.0.1:9094:9094"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_DB: botsight
+      CLICKHOUSE_USER: botsight
+      CLICKHOUSE_PASSWORD: botsight
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "127.0.0.1:8123:8123" # HTTP
+      - "127.0.0.1:9000:9000" # native
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "botsight", "--password", "botsight", "--query", "SELECT 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   migrate:
     image: migrate/migrate:v4.18.1
     volumes:
@@ -43,6 +93,15 @@ services:
     command: ["-path", "/migrations", "-database", "postgres://botsight:botsight@postgres:5432/botsight?sslmode=disable", "up"]
     depends_on:
       postgres:
+        condition: service_healthy
+
+  migrate-clickhouse:
+    image: migrate/migrate:v4.18.1
+    volumes:
+      - ../migrations/clickhouse:/migrations:ro
+    command: ["-path", "/migrations", "-database", "clickhouse://clickhouse:9000?username=botsight&password=botsight&database=botsight&x-multi-statement=true", "up"]
+    depends_on:
+      clickhouse:
         condition: service_healthy
 
   api:
@@ -68,5 +127,50 @@ services:
       mailpit:
         condition: service_started
 
+  collector:
+    build:
+      context: ../backend
+      args:
+        SERVICE: collector
+    environment:
+      DATABASE_URL: postgres://botsight:botsight@postgres:5432/botsight?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+      INGEST_RATE: ${INGEST_RATE:-2000}   # events per second per project
+      INGEST_BURST: ${INGEST_BURST:-20000}
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  chwriter:
+    build:
+      context: ../backend
+      args:
+        SERVICE: chwriter
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+      CLICKHOUSE_ADDR: clickhouse:9000
+      CLICKHOUSE_USER: botsight
+      CLICKHOUSE_PASSWORD: botsight
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8082:8082"
+    depends_on:
+      migrate-clickhouse:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
 volumes:
   postgres-data:
+  clickhouse-data:
