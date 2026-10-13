@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> None:
             llm,
             KafkaAlertSink(cfg.kafka_brokers),
         )
-        scheduler = TopicScheduler(runner, clickhouse(cfg.clickhouse), rdb, cfg.topics_interval)
+        scheduler = TopicScheduler(runner, rdb, cfg.topics_interval)
         start("topics", partial(scheduler.loop, stop))
     if cmd in ("all", "anomalies"):
         detector = AnomalyDetector(

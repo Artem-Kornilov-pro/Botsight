@@ -40,7 +40,13 @@ jobs:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
       - name: start the local environment
-        run: docker compose -f deploy/docker-compose.yml up -d --build
+        # Docker Hub sometimes answers 502 on pulls: up is idempotent, so it is retried
+        run: |
+          for i in 1 2 3 4; do
+            docker compose -f deploy/docker-compose.yml up -d --build && exit 0
+            sleep $((i * 15))
+          done
+          exit 1
       - name: services are ready
         run: |
           for i in $(seq 1 90); do
