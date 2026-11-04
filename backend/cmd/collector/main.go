@@ -93,7 +93,8 @@ func run() error {
 			}
 			return nil
 		},
-		Config: ingest.Config{MaxInflight: cfg.MaxInflight},
+		Config:     ingest.Config{MaxInflight: cfg.MaxInflight},
+		Broadcasts: &ingest.Broadcasts{Store: st, Redis: rdb},
 	})
 
 	httpServer := &http.Server{

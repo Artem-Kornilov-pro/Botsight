@@ -49,6 +49,8 @@ type Collector struct {
 	gatherer prometheus.Gatherer
 	ready    func(context.Context) error
 	cfg      Config
+	// broadcasts serves the SDK's broadcast work; nil turns the endpoints off
+	broadcasts *Broadcasts
 
 	inflight chan struct{}
 	shutting atomic.Bool
@@ -65,8 +67,9 @@ type Deps struct {
 	Metrics  *Metrics
 	Gatherer prometheus.Gatherer
 	// Ready checks Kafka and Redis for /readyz.
-	Ready  func(context.Context) error
-	Config Config
+	Ready      func(context.Context) error
+	Config     Config
+	Broadcasts *Broadcasts
 }
 
 func New(d Deps) *Collector {
@@ -78,7 +81,7 @@ func New(d Deps) *Collector {
 	}
 	return &Collector{
 		keys: d.Keys, gate: d.Gate, producer: d.Producer, bots: d.Bots, log: d.Logger,
-		metrics: d.Metrics, gatherer: d.Gatherer, ready: d.Ready, cfg: d.Config,
+		metrics: d.Metrics, gatherer: d.Gatherer, ready: d.Ready, cfg: d.Config, broadcasts: d.Broadcasts,
 		inflight: make(chan struct{}, d.Config.MaxInflight),
 		now:      time.Now,
 	}
@@ -93,6 +96,11 @@ func (c *Collector) Wait() { c.jobs.Wait() }
 func (c *Collector) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/batch", c.handleBatch)
+	if c.broadcasts != nil {
+		c.broadcasts.defaults()
+		mux.HandleFunc("POST /v1/broadcasts/lease", c.leaseBroadcast)
+		mux.HandleFunc("POST /v1/broadcasts/report", c.reportBroadcast)
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})

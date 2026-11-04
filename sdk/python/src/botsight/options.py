@@ -31,6 +31,9 @@ class Options:
     max_queue: int = 10_000
     sample_rate: float = 1.0
     enabled: bool = True
+    broadcasts: bool = False
+    broadcast_rate: float = 25.0
+    broadcast_poll_interval: float = 15.0
 
     @classmethod
     def build(
@@ -50,6 +53,9 @@ class Options:
         max_queue: int = 10_000,
         sample_rate: float = 1.0,
         enabled: bool = True,
+        broadcasts: bool = False,
+        broadcast_rate: float = 25.0,
+        broadcast_poll_interval: float = 15.0,
     ) -> Options:
         if not isinstance(endpoint, str) or not endpoint.startswith(("https://", "http://")):
             raise ValueError("botsight: endpoint must be an http(s) URL")
@@ -71,6 +77,19 @@ class Options:
             or not 0 <= sample_rate <= 1
         ):
             raise ValueError("botsight: sample_rate must be in [0, 1]")
+        # Telegram allows about 30 messages a second for a bot; the bot's own replies share it
+        if not isinstance(broadcast_rate, (int, float)) or not 1 <= broadcast_rate <= 30:
+            raise ValueError("botsight: broadcast_rate must be in [1, 30] messages a second")
+        if (
+            not isinstance(broadcast_poll_interval, (int, float))
+            or not 1 <= broadcast_poll_interval <= 300
+        ):
+            raise ValueError("botsight: broadcast_poll_interval must be in [1, 300] seconds")
+        if broadcasts and pseudonymize_user_ids:
+            raise ValueError(
+                "botsight: broadcasts=True needs real chat ids, it cannot work with "
+                "pseudonymize_user_ids=True"
+            )
 
         secret: bytes | None = None
         if pseudonymize_user_ids:
@@ -99,6 +118,9 @@ class Options:
             max_queue=max_queue,
             sample_rate=float(sample_rate),
             enabled=bool(enabled),
+            broadcasts=bool(broadcasts),
+            broadcast_rate=float(broadcast_rate),
+            broadcast_poll_interval=float(broadcast_poll_interval),
         )
 
 

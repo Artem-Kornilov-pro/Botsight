@@ -31,6 +31,7 @@ tags:
   - name: funnels
   - name: ad-spend
   - name: analytics
+  - name: broadcasts
   - name: ai
   - name: antifraud
   - name: health
@@ -466,6 +467,122 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{projectID}/broadcasts/preview:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    post:
+      tags: [broadcasts]
+      summary: Size of a segment (any member)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [segment]
+              properties:
+                segment: { $ref: "#/components/schemas/Segment" }
+      responses:
+        "200":
+          description: Recipients of the segment now
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [segment, recipients, max_recipients]
+                properties:
+                  segment: { $ref: "#/components/schemas/Segment" }
+                  recipients: { type: integer }
+                  max_recipients: { type: integer }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/TooHeavy" }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
+  /v1/projects/{projectID}/broadcasts:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [broadcasts]
+      summary: The latest 50 broadcasts with progress (any member)
+      responses:
+        "200":
+          description: Broadcasts, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [broadcasts]
+                properties:
+                  broadcasts: { type: array, items: { $ref: "#/components/schemas/Broadcast" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [broadcasts]
+      summary: Send a message to a segment (editor)
+      description: |
+        Recipients are fixed now, from the analytics. The SDK inside the bot (option
+        `broadcasts=True`) leases them from the collector, sends the messages within the
+        Telegram limits and reports the results; the bot token never leaves the bot.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, segment]
+              additionalProperties: false
+              properties:
+                text: { type: string, minLength: 1, maxLength: 4096 }
+                parse_mode: { type: string, enum: ["", HTML, MarkdownV2], default: "" }
+                segment: { $ref: "#/components/schemas/Segment" }
+      responses:
+        "201":
+          description: Created and sending
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Broadcast" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { description: "`empty_segment`, `segment_too_large` (over 100 000) or `query_too_heavy`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
+  /v1/projects/{projectID}/broadcasts/{broadcastID}:
+    parameters:
+      - { $ref: "#/components/parameters/ProjectID" }
+      - { name: broadcastID, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    get:
+      tags: [broadcasts]
+      summary: A broadcast with progress and failure reasons (any member)
+      responses:
+        "200":
+          description: The broadcast
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Broadcast" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/projects/{projectID}/broadcasts/{broadcastID}/cancel:
+    parameters:
+      - { $ref: "#/components/parameters/ProjectID" }
+      - { name: broadcastID, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    post:
+      tags: [broadcasts]
+      summary: Stop a broadcast (editor); recipients already leased may still get it
+      responses:
+        "200":
+          description: Canceled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Broadcast" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "`not_sending`: already done or canceled", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   /v1/projects/{projectID}/funnels:
     parameters: [{ $ref: "#/components/parameters/ProjectID" }]
@@ -1042,7 +1159,7 @@ components:
                      invalid_credentials, wrong_password, no_password, no_email, already_verified, invalid_token,
                      telegram_disabled, invalid_telegram_auth, telegram_taken, account_not_found, already_member,
                      last_owner, period_overlap, analytics_unavailable, ai_unavailable, invalid_sql,
-                     query_failed, llm_error, llm_disabled, invalid_question, query_too_heavy, live_unavailable, too_many_streams]
+                     query_failed, llm_error, llm_disabled, invalid_question, query_too_heavy, live_unavailable, too_many_streams, empty_segment, segment_too_large, not_sending]
             message: { type: string }
             field: { type: string, description: The invalid field for validation_failed }
 
@@ -1395,6 +1512,41 @@ components:
         error: { type: string }
         props_str: { type: object, additionalProperties: { type: string } }
         props_num: { type: object, additionalProperties: { type: number } }
+
+    Segment:
+      type: object
+      additionalProperties: false
+      description: |
+        Users who wrote to the bot in a private chat within active_days. Users who blocked the
+        bot after their last message are always left out.
+      properties:
+        active_days: { type: integer, minimum: 1, maximum: 365, default: 30 }
+        inactive_days: { type: integer, minimum: 0, description: "Quiet for at least this many days; less than active_days" }
+        source: { type: string, description: 'First /start label; "" for users who came without one' }
+        reached: { $ref: "#/components/schemas/FunnelStep" }
+        not_reached: { $ref: "#/components/schemas/FunnelStep" }
+
+    Broadcast:
+      type: object
+      required: [id, text, parse_mode, segment, status, total, stats, created_at, finished_at]
+      properties:
+        id: { type: integer }
+        text: { type: string }
+        parse_mode: { type: string }
+        segment: { $ref: "#/components/schemas/Segment" }
+        status: { type: string, enum: [sending, done, canceled] }
+        total: { type: integer }
+        stats:
+          type: object
+          required: [pending, sent, blocked, failed]
+          properties:
+            pending: { type: integer }
+            sent: { type: integer }
+            blocked: { type: integer }
+            failed: { type: integer }
+            errors: { type: object, additionalProperties: { type: integer }, description: "Failure reasons, in GET of one broadcast" }
+        created_at: { type: string, format: date-time }
+        finished_at: { type: ["string", "null"], format: date-time }
 
     AdSpend:
       type: object

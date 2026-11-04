@@ -15,6 +15,7 @@ from aiogram import Bot, Dispatcher
 
 from ._log import logger
 from ._version import __version__
+from .broadcast import Broadcaster
 from .client import Botsight
 from .middlewares import OutgoingMiddleware, StepMiddleware, UpdateMiddleware, blocks_router
 
@@ -50,6 +51,8 @@ def setup(dp: Dispatcher, bot: Bot, api_key: str, **options: Any) -> Botsight:
     bot.session.middleware(OutgoingMiddleware(client))
     if client.options.track_blocks:
         dp.include_router(blocks_router())
+    if client.options.broadcasts:
+        client._broadcaster = Broadcaster(client, bot)
 
     dp.startup.register(client.start)
     dp.shutdown.register(client.close)

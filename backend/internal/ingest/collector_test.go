@@ -82,6 +82,7 @@ type options struct {
 	maxInflight int
 	producer    ingest.Producer
 	captureText bool
+	broadcasts  *ingest.Broadcasts
 }
 
 var accountSeq atomic.Int64
@@ -122,8 +123,9 @@ func newHarness(t *testing.T, o options) *harness {
 	c := ingest.New(ingest.Deps{
 		Keys: keys, Gate: ingest.NewGate(env.Redis, o.rate, o.burst), Producer: o.producer, Bots: st,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: m, Gatherer: reg,
-		Ready:  func(ctx context.Context) error { return env.Redis.Ping(ctx).Err() },
-		Config: ingest.Config{MaxInflight: o.maxInflight},
+		Ready:      func(ctx context.Context) error { return env.Redis.Ping(ctx).Err() },
+		Config:     ingest.Config{MaxInflight: o.maxInflight},
+		Broadcasts: o.broadcasts,
 	})
 	srv := httptest.NewServer(c.Handler())
 	t.Cleanup(func() {
