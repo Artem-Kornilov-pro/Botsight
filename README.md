@@ -37,7 +37,7 @@ flowchart LR
 | `api` | аккаунты, проекты, ключи (PostgreSQL); аналитика из ClickHouse — обзор, воронки (`windowFunnel`), источники и стоимость пользователя, когорты (`retention`), ошибки, граф FSM, таймлайн; живая лента событий по SSE из Kafka; рассылки по сегментам | [backend/internal/httpapi](backend/internal/httpapi), [backend/internal/query](backend/internal/query), [OpenAPI](backend/api/openapi.yaml) |
 | `botproxy` | шлюз к Bot API для ботов без SDK: поток без буферизации, long polling, вебхуки, дедупликация апдейтов | [backend/internal/botproxy](backend/internal/botproxy) |
 | `antifraud` | доля ботоферм по источникам: признаки пользователей из потока, скоринг, реферальный граф | [backend/internal/antifraud](backend/internal/antifraud) |
-| Дашборд | React + TypeScript: вход, проекты, подключение бота с ожиданием первого события по SSE, обзор, живая лента; типы API генерируются из OpenAPI | [web](web) |
+| Дашборд | React + TypeScript: подключение бота с ожиданием первого события по SSE, обзор, живая лента, воронки, источники, удержание, граф сценария, ошибки, таймлайн, рассылки, антифрод, AI, настройки; типы API генерируются из OpenAPI | [web](web) |
 | `ai-worker` | темы сообщений (эмбеддинги + HDBSCAN), вопросы на естественном языке → проверенный SQL, объяснение аномалий | [ai](ai) |
 
 ## Инженерные решения
