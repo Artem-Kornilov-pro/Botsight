@@ -307,3 +307,41 @@ func LoadAntifraud() (Antifraud, error) {
 	}
 	return c, nil
 }
+
+// BotProxy is the configuration of the Bot API proxy (Botsight.md, 20).
+type BotProxy struct {
+	Addr           string        // BOTPROXY_ADDR, default :8084; /healthz, /readyz, /metrics on the same port
+	TelegramURL    string        // TELEGRAM_API_URL, default https://api.telegram.org
+	CollectorURL   string        // COLLECTOR_URL, required: where the events go
+	PublicURL      string        // BOTPROXY_PUBLIC_URL as Telegram sees the proxy; empty: webhooks go around it
+	RedisURL       string        // REDIS_URL: webhook addresses; empty keeps them in memory (one instance)
+	UnsafeWebhooks bool          // BOTPROXY_UNSAFE_WEBHOOKS: http and private addresses, local development only
+	QueueSize      int           // BOTPROXY_QUEUE: events waiting for the collector, default 100 000
+	FlushInterval  time.Duration // BOTPROXY_FLUSH_INTERVAL, default 1s
+	LogLevel       string
+}
+
+func LoadBotProxy() (BotProxy, error) {
+	c := BotProxy{
+		Addr:         env("BOTPROXY_ADDR", ":8084"),
+		TelegramURL:  strings.TrimRight(env("TELEGRAM_API_URL", "https://api.telegram.org"), "/"),
+		CollectorURL: strings.TrimRight(os.Getenv("COLLECTOR_URL"), "/"),
+		PublicURL:    strings.TrimRight(os.Getenv("BOTPROXY_PUBLIC_URL"), "/"),
+		RedisURL:     os.Getenv("REDIS_URL"),
+		LogLevel:     env("LOG_LEVEL", "info"),
+	}
+	p := parser{}
+	c.UnsafeWebhooks = p.bool("BOTPROXY_UNSAFE_WEBHOOKS", false)
+	c.QueueSize = p.int("BOTPROXY_QUEUE", 100_000)
+	c.FlushInterval = p.duration("BOTPROXY_FLUSH_INTERVAL", time.Second)
+	if p.err != nil {
+		return c, p.err
+	}
+	if c.CollectorURL == "" {
+		return c, fmt.Errorf("config: COLLECTOR_URL is required")
+	}
+	if c.QueueSize < 1 {
+		return c, fmt.Errorf("config: BOTPROXY_QUEUE must be positive")
+	}
+	return c, nil
+}
