@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"time"
 )
 
 // Segment chooses the recipients of a broadcast (Botsight.md, 22) from the analytics:
@@ -101,6 +102,7 @@ WHERE b.blocked_at < u.last_seen` + where + tail}, nil
 
 // SegmentSize counts the recipients; not cached, the owner checks it right before sending.
 func (r *Runner) SegmentSize(ctx context.Context, projectID uint32, s Segment) (uint64, error) {
+	defer r.Metrics.took("segment", time.Now())
 	q, err := segmentQuery(projectID, s, true, 0)
 	if err != nil {
 		return 0, err
@@ -112,6 +114,7 @@ func (r *Runner) SegmentSize(ctx context.Context, projectID uint32, s Segment) (
 
 // SegmentChats returns up to limit chat ids of the segment.
 func (r *Runner) SegmentChats(ctx context.Context, projectID uint32, s Segment, limit int) ([]int64, error) {
+	defer r.Metrics.took("segment", time.Now())
 	q, err := segmentQuery(projectID, s, false, limit)
 	if err != nil {
 		return nil, err

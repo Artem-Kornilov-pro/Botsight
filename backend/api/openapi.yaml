@@ -53,6 +53,18 @@ paths:
         "200": { description: Ready }
         "503": { $ref: "#/components/responses/Error" }
 
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus metrics of this instance (Botsight.md, 17.1)
+      security: []
+      responses:
+        "200":
+          description: Metrics in the Prometheus text format
+          content:
+            text/plain:
+              schema: { type: string }
+
   /v1/auth/register:
     post:
       tags: [auth]

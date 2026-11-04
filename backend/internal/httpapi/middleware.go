@@ -65,6 +65,7 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		if rc := chi.RouteContext(r.Context()); rc != nil {
 			route = rc.RoutePattern()
 		}
+		s.Metrics.observe(r, ww, time.Since(start))
 		s.Logger.Info("request",
 			"method", r.Method, "route", route, "status", ww.Status(),
 			"duration_ms", time.Since(start).Milliseconds())

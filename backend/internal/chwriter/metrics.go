@@ -10,6 +10,7 @@ type Metrics struct {
 	DLQ            *prometheus.CounterVec
 	Lag            *prometheus.GaugeVec
 	Paused         prometheus.Gauge
+	Freshness      *prometheus.HistogramVec
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -33,7 +34,15 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		Paused: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "botsight_ch_paused_partitions", Help: "Partitions paused by backpressure.",
 		}),
+		// SLO "freshness" (Botsight.md, 17.2): from the collector's write to Kafka until
+		// the row can be queried. One observation per chunk, its oldest record: the
+		// worst case of the chunk, cheap at any event rate.
+		Freshness: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "botsight_ch_freshness_seconds",
+			Help:    "Age of the oldest record of a chunk when its insert into ClickHouse finished.",
+			Buckets: []float64{.25, .5, .75, 1, 1.25, 1.5, 2, 3, 5, 7.5, 10, 15, 30, 60, 300},
+		}, []string{"table"}),
 	}
-	reg.MustRegister(m.Rows, m.InsertDuration, m.InsertErrors, m.DLQ, m.Lag, m.Paused)
+	reg.MustRegister(m.Rows, m.InsertDuration, m.InsertErrors, m.DLQ, m.Lag, m.Paused, m.Freshness)
 	return m
 }

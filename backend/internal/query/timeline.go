@@ -99,6 +99,7 @@ LIMIT ` + p.P("page_size", "UInt32", uint32(limit))}
 // Timeline returns up to limit events of the user before the cursor, or before now.
 // It reads a narrow slice of the sort key and is not cached.
 func (r *Runner) Timeline(ctx context.Context, projectID uint32, userID uint64, after *Cursor, now time.Time, limit int) (Timeline, error) {
+	defer r.Metrics.took("timeline", time.Now())
 	rows, err := r.query(ctx, timelineQuery(projectID, userID, after, now, limit))
 	if err != nil {
 		return Timeline{}, err

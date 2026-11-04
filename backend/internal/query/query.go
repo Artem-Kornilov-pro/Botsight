@@ -42,6 +42,8 @@ type Runner struct {
 	TTL   time.Duration
 	// MaxExecutionTime is max_execution_time of every query; 0 means 20 s.
 	MaxExecutionTime time.Duration
+	// Metrics records query times and cache hits; nil records nothing.
+	Metrics *Metrics
 }
 
 func (r *Runner) ctx(ctx context.Context) context.Context {
@@ -77,6 +79,7 @@ func mapErr(err error) error {
 // stores it. Cache failures are not errors: the query just runs.
 func cached[T any](ctx context.Context, r *Runner, kind string, key any, compute func(context.Context) (T, error)) (T, bool, error) {
 	var zero T
+	compute = timed(r, kind, compute)
 	if r.Cache == nil || r.TTL <= 0 {
 		out, err := compute(ctx)
 		return out, false, err
@@ -93,9 +96,11 @@ func cached[T any](ctx context.Context, r *Runner, kind string, key any, compute
 	if b, err := r.Cache.Get(ctx, redisKey).Bytes(); err == nil {
 		var out T
 		if json.Unmarshal(b, &out) == nil {
+			r.Metrics.cache(kind, true)
 			return out, true, nil
 		}
 	}
+	r.Metrics.cache(kind, false)
 	out, err := compute(ctx)
 	if err != nil {
 		return zero, false, err
@@ -104,6 +109,14 @@ func cached[T any](ctx context.Context, r *Runner, kind string, key any, compute
 		_ = r.Cache.Set(ctx, redisKey, b, r.TTL).Err()
 	}
 	return out, false, nil
+}
+
+// timed records how long the queries of a kind take in ClickHouse.
+func timed[T any](r *Runner, kind string, compute func(context.Context) (T, error)) func(context.Context) (T, error) {
+	return func(ctx context.Context) (T, error) {
+		defer r.Metrics.took(kind, time.Now())
+		return compute(ctx)
+	}
 }
 
 // Query is SQL with {name:Type} placeholders and their values.

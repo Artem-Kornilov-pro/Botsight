@@ -1,0 +1,46 @@
+# promtool test rules deploy/prometheus/rules_test.yml
+rule_files: [rules.yml]
+evaluation_interval: 1m
+
+tests:
+  # 2 % of batches fail for an hour: 20x the budget rate, the fast burn pages
+  - interval: 1m
+    input_series:
+      - series: 'botsight_ingest_requests_total{code="202"}'
+        values: '0+980x90'
+      - series: 'botsight_ingest_requests_total{code="503"}'
+        values: '0+20x90'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: IngestErrorBudgetFastBurn
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: "Приём теряет бюджет ошибок в 14 раз быстрее нормы"
+              description: "Доля 5xx на /v1/batch 2% за час: за час уходит 2 % месячного бюджета."
+
+  # 0.05 % of errors is within the budget: no alert
+  - interval: 1m
+    input_series:
+      - series: 'botsight_ingest_requests_total{code="202"}'
+        values: '0+9995x90'
+      - series: 'botsight_ingest_requests_total{code="500"}'
+        values: '0+5x90'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: IngestErrorBudgetFastBurn
+        exp_alerts: []
+
+  # a scrape target down for 3 minutes
+  - interval: 1m
+    input_series:
+      - series: 'up{job="chwriter", instance="chwriter:8082"}'
+        values: '1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ServiceDown
+        exp_alerts:
+          - exp_labels: { severity: page, job: chwriter, instance: "chwriter:8082" }
+            exp_annotations:
+              summary: "chwriter не отвечает"
+              description: "Prometheus не может снять метрики chwriter:8082 2 минуты."

@@ -72,6 +72,8 @@ type Deps struct {
 	ClickHouse driver.Conn
 	// Live streams events as they arrive; nil turns /live off (503).
 	Live *live.Hub
+	// Metrics for /metrics; nil serves an empty registry.
+	Metrics *Metrics
 	// HTTPClient calls ai-worker; nil means a client with a 60 s timeout.
 	HTTPClient *http.Client
 	Options    Options
@@ -94,6 +96,9 @@ func New(d Deps) *Server {
 	s := &Server{Deps: d}
 	if d.ClickHouse != nil {
 		s.queries = &query.Runner{Conn: d.ClickHouse, Cache: d.Redis, TTL: queryCacheTTL}
+		if d.Metrics != nil {
+			s.queries.Metrics = d.Metrics.Queries
+		}
 	}
 	s.ready.Store(true)
 	return s
@@ -135,6 +140,7 @@ func (s *Server) Handler() http.Handler {
 
 	r.Get("/healthz", s.healthz)
 	r.Get("/readyz", s.readyz)
+	r.Get("/metrics", s.metrics)
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(s.requireJSON)

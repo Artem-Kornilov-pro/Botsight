@@ -112,6 +112,13 @@ func (s *Sub) TakeDropped() int64 { return s.dropped.Swap(0) }
 // Close ends the subscription; the consumer stops after Linger without subscribers.
 func (s *Sub) Close() { s.once.Do(func() { s.hub.remove(s) }) }
 
+// Streams is the number of open subscriptions, for the metrics.
+func (h *Hub) Streams() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.total
+}
+
 // Running reports whether the consumer reads the topic, for tests and readiness.
 func (h *Hub) Running() bool {
 	h.mu.RLock()

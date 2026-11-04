@@ -13,6 +13,8 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/clickhouse"
@@ -93,6 +95,14 @@ func run() error {
 		logger.Warn("KAFKA_BROKERS is not set: the live stream of events is disabled")
 	}
 
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	var streams func() int
+	if hub != nil {
+		streams = hub.Streams
+	}
+	metrics := httpapi.NewMetrics(reg, streams)
+
 	srv := httpapi.New(httpapi.Deps{
 		Store:      store.New(pool),
 		Sessions:   session.NewStore(rdb, cfg.SessionTTL),
@@ -102,6 +112,7 @@ func run() error {
 		Logger:     logger,
 		ClickHouse: ch,
 		Live:       hub,
+		Metrics:    metrics,
 		Options: httpapi.Options{
 			DashboardURL:  cfg.DashboardURL,
 			CORSOrigins:   cfg.CORSOrigins,
