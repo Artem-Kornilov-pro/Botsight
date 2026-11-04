@@ -11,7 +11,23 @@ await dp.start_polling(bot)
 
 SDK работает внутри процесса бота и отправляет на сервер только события. Токен бота не покидает инфраструктуру владельца, тексты сообщений по умолчанию не собираются. Если Botsight недоступен, бот продолжает работать как обычно. Для ботов на Go есть Go SDK (одна опция HTTP-клиента и middleware для `go-telegram/bot`), для ботов на других языках — режим прокси Bot API: достаточно поменять адрес Bot API.
 
-Подробное проектирование — в [Botsight.md](Botsight.md).
+Текущая версия — **0.1.0** ([изменения](CHANGELOG.md)): весь путь от бота до дашборда, разворачивается одной командой. Для продакшена ещё не всё готово, ограничения перечислены в [docs/operations.md](docs/operations.md#ограничения-010-и-что-нужно-до-продакшена).
+
+## Документация
+
+| Документ | О чём |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | как устроена система: путь события, гарантии доставки, топики Kafka, таблицы, изоляция клиентов |
+| [docs/operations.md](docs/operations.md) | стенд, адреса сервисов, метрики, дашборды, SLO и алерты с подсказками, трассировка, безопасность, ограничения 0.1.0 |
+| [backend/README.md](backend/README.md) | Go-сервисы: запуск, примеры запросов к API, все переменные окружения, миграции |
+| [backend/api/openapi.yaml](backend/api/openapi.yaml) | API дашборда (OpenAPI 3) |
+| [docs/contract/batch_v1.json](docs/contract/batch_v1.json) | контракт батча SDK → collector (JSON Schema) |
+| [sdk/python/README.md](sdk/python/README.md), [sdk/go/README.md](sdk/go/README.md) | SDK: подключение, что собирается, параметры, гарантии |
+| [web/README.md](web/README.md) | дашборд: экраны, устройство, проверки |
+| [ai/README.md](ai/README.md) | AI-модуль: темы, вопросы на естественном языке, аномалии |
+| [loadtest/README.md](loadtest/README.md) | хаос-тесты и их результаты до и после исправления |
+| [Botsight.md](Botsight.md) | проектный документ: продукт, архитектура, решения и их обоснования, планы |
+| [CHANGELOG.md](CHANGELOG.md) | что вошло в каждую версию |
 
 ## Архитектура
 
@@ -53,29 +69,80 @@ flowchart LR
 - **Наблюдаемость как код.** Prometheus и Grafana поднимаются вместе со стеком. Дашборды генерируются из Python, SLO-алерты на бюджет ошибок с двумя скоростями сгорания покрыты `promtool test rules`, свежесть данных от Kafka до ClickHouse меряется отдельной метрикой. Сквозная трассировка OpenTelemetry: трейс батча начинается в collector, идёт в заголовках Kafka и заканчивается в ch-writer после коммита, его видно в Jaeger и Grafana.
 - **Тесты.** Интеграционные тесты поднимают PostgreSQL, Redis, Kafka и ClickHouse через testcontainers. e2e в CI запускает всё окружение в docker compose, гонит нагрузку `loadgen` и проверяет данные в ClickHouse, темы ИИ, точность антифрода и ответы API аналитики.
 
-## Запуск
+## Быстрый старт
 
-Нужен Docker.
+Нужны Docker с Compose, Go 1.26 для генератора нагрузки и Node.js 24 для дашборда (версии из CI).
+
+**1. Поднять стек.** Из корня репозитория:
 
 ```bash
-docker compose -f deploy/docker-compose.yml up --build
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-Поднимутся хранилища, применятся миграции, запустятся все сервисы. Адреса, настройки и примеры запросов — в [backend/README.md](backend/README.md). Нагрузка и демо-данные:
+Первая сборка занимает несколько минут. Поднимутся хранилища, применятся миграции, запустятся все сервисы, Prometheus, Grafana и Jaeger. Адреса — в [docs/operations.md](docs/operations.md#стенд-в-docker-compose).
+
+**2. Запустить дашборд:**
+
+```bash
+cd web && npm install && npm run dev     # http://localhost:5173
+```
+
+**3. Наполнить данными.** Генератор создаёт аккаунт и проекты и шлёт трафик ботов в формате SDK, включая тексты для AI и ботофермы для антифрода:
 
 ```bash
 cd backend && go run ./cmd/loadgen -projects 3 -users 500 -rate 3000 -duration 30s -texts -fraud 0.2
 ```
 
-Тесты:
+В конце он печатает почту аккаунта, пароль — `loadgen-password`. Войдите с ними на http://localhost:5173.
+
+**4. Подключить своего бота.** Зарегистрируйтесь в дашборде, создайте проект и скопируйте ключ: он показывается один раз. Затем передайте SDK ключ и адрес collector:
+
+```python
+from botsight import setup
+
+setup(dp, bot, api_key="bs_live_...", endpoint="http://localhost:8081")
+```
+
+Экран подключения покажет «Бот подключён», как только придёт первое событие. Боты на других языках подключаются через прокси Bot API: адрес Bot API меняется на `http://localhost:8084/k/<ключ>` (см. [backend/README.md](backend/README.md#настройки-botproxy)).
+
+**5. Посмотреть, как работает система изнутри:**
+- Grafana на http://localhost:3000 — дашборды «Приём и конвейер», «API и аналитика», «SLO»;
+- Jaeger на http://localhost:16686 — трейс батча от collector до ClickHouse.
+
+## Установка SDK
+
+Python SDK пока не опубликован в PyPI, его ставят из репозитория по тегу версии:
 
 ```bash
-cd backend && go test -race ./...     # Go; интеграционные тесты используют Docker
+pip install "botsight @ git+https://github.com/Artem-Kornilov-pro/Botsight.git@v0.1.0#subdirectory=sdk/python"
+```
+
+Go SDK — отдельный модуль в подкаталоге, у него свой тег `sdk/go/v0.1.0`:
+
+```bash
+go get github.com/Artem-Kornilov-pro/Botsight/sdk/go@v0.1.0
+```
+
+При самостоятельном развёртывании передайте SDK адрес своего collector: `endpoint=...` в Python, `botsight.WithEndpoint(...)` в Go.
+
+## Тесты
+
+```bash
+cd backend && go test -race ./...     # Go; интеграционные тесты поднимают зависимости через testcontainers, нужен Docker
 cd sdk/python && pytest               # Python SDK
 cd sdk/go && go test -race ./...      # Go SDK
 cd ai && pytest                       # ai-worker
 cd web && npm test                    # дашборд; npm run e2e — Playwright против стека
+loadtest/chaos.sh                     # хаос-тесты против стека, см. loadtest/README.md
 ```
+
+В CI каждый компонент проверяется отдельным workflow (`.github/workflows`). e2e поднимает весь стек и сверяет данные, хаос-тесты запускаются каждую ночь.
+
+## Версии
+
+Версии следуют [SemVer](https://semver.org/lang/ru/). До 1.0.0 протокол SDK и API могут меняться в минорных версиях, такие изменения отмечаются в [CHANGELOG.md](CHANGELOG.md). Теги:
+- `vX.Y.Z` — весь проект;
+- `sdk/go/vX.Y.Z` — Go SDK, этого требует Go для модуля в подкаталоге.
 
 ## Стек
 
