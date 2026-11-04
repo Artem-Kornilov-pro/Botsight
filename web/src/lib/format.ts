@@ -52,3 +52,24 @@ export function dateTime(iso: string): string {
 export function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
+
+const pluralRules = new Intl.PluralRules("ru-RU");
+
+/** 1 вид, 2 вида, 5 видов: forms for one, few, many. */
+export function plural(n: number, one: string, few: string, many: string): string {
+  const form = pluralRules.select(n);
+  return `${full.format(n)} ${form === "one" ? one : form === "few" ? few : many}`;
+}
+
+const preciseFmt = new Intl.DateTimeFormat("ru-RU", {
+  day: "numeric",
+  month: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+});
+
+/** To the second: a timeline where a bot answers within one minute. */
+export function dateTimeSec(iso: string): string {
+  return preciseFmt.format(new Date(iso));
+}

@@ -66,3 +66,40 @@ test("overview of a bot with traffic", async ({ page }) => {
   await page.getByRole("link", { name: "Живая лента" }).click();
   await expect(page.getByRole("status")).toHaveText(/в эфире/);
 });
+
+test("analytics screens on loadgen data", async ({ page }) => {
+  const email = process.env.E2E_EMAIL;
+  test.skip(!email, "E2E_EMAIL: the account printed by loadgen");
+  await page.goto("/login");
+  await page.getByLabel("Почта").fill(email!);
+  await page.getByLabel("Пароль").fill("loadgen-password");
+  await page.getByRole("button", { name: "Войти" }).click();
+  await page.getByRole("link", { name: /loadgen 1/ }).click();
+
+  // funnel: /start -> Form:lab, split by source
+  await page.getByRole("link", { name: "Воронки" }).click();
+  await page.getByLabel("Шаг 2: значение").fill("Form:lab");
+  await page.getByLabel("по источникам").check();
+  await page.getByRole("button", { name: "Посчитать" }).click();
+  const funnel = page.locator("section.card", { hasText: "Дошли до шага" });
+  await funnel.getByRole("button", { name: "Таблица" }).click();
+  await expect(funnel.locator("tbody tr")).toHaveCount(2);
+  await expect(funnel.locator("tbody tr").first().locator("td").nth(1)).not.toHaveText("0");
+  await expect(page.getByRole("heading", { name: "По источникам" })).toBeVisible();
+
+  for (const [link, heading] of [
+    ["Источники", "Все источники"],
+    ["Удержание", "Недельные когорты"],
+    ["Граф сценария", "Переходы между состояниями"],
+    ["Ошибки", "Исключения в хендлерах"],
+  ] as const) {
+    await page.getByRole("link", { name: link, exact: true }).click();
+    await expect(page.getByRole("heading", { name: heading })).toBeVisible();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  }
+
+  await page.getByRole("link", { name: "Пользователь" }).click();
+  await page.getByLabel("user_id").fill("100000000");
+  await page.getByRole("button", { name: "Показать" }).click();
+  await expect(page.getByRole("heading", { name: "События, новые сверху" })).toBeVisible();
+});

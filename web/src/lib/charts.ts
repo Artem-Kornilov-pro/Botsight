@@ -145,3 +145,48 @@ export function columnChart(t: ChartTokens, days: string[], series: Series[], ma
     })),
   };
 }
+
+/** Ranked horizontal bars of one series: funnel steps, sources. One hue, value at the tip. */
+export function barChart(
+  t: ChartTokens,
+  labels: string[],
+  values: number[],
+  tip: (i: number) => string,
+): Option {
+  return {
+    animation: false,
+    grid: { left: 8, right: 96, top: 8, bottom: 4, containLabel: true },
+    xAxis: {
+      type: "value",
+      splitLine: { lineStyle: { color: t.grid, width: 1, type: "solid" } },
+      axisLabel: { color: t.muted, formatter: (v: number) => compact(v) },
+    },
+    yAxis: {
+      type: "category",
+      data: labels,
+      inverse: true, // the first item on top
+      axisLine: { lineStyle: { color: t.axis } },
+      axisTick: { show: false },
+      axisLabel: { color: t.textSecondary, width: 160, overflow: "truncate" },
+    },
+    tooltip: {
+      trigger: "item",
+      backgroundColor: t.surface,
+      borderColor: t.grid,
+      textStyle: { color: t.text },
+      formatter: (p: { dataIndex: number; name: string; value: number }) =>
+        `<b>${escapeHtml(number(p.value))}</b> <span style="color:${t.textSecondary}">${escapeHtml(p.name)}</span>` +
+        `<div style="color:${t.textSecondary}">${escapeHtml(tip(p.dataIndex))}</div>`,
+    },
+    series: [
+      {
+        type: "bar",
+        data: values,
+        barMaxWidth: 24,
+        itemStyle: { color: t.series[0], borderRadius: [0, 4, 4, 0] },
+        emphasis: { itemStyle: { opacity: 0.85 } },
+        label: { show: true, position: "right", color: t.textSecondary, formatter: (p: { dataIndex: number }) => tip(p.dataIndex) },
+      },
+    ],
+  };
+}

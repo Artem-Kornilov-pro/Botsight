@@ -460,3 +460,16 @@ pre.code {
 .card > h2 + div {
   margin-top: 10px;
 }
+
+/* heatmap: cells separated by a 2px surface gap, rounded */
+table.data.heat {
+  border-collapse: separate;
+  border-spacing: 2px;
+}
+table.data.heat td {
+  border-bottom: 0;
+}
+table.data.heat td.heat-cell {
+  border-radius: 4px;
+  min-width: 64px;
+}
