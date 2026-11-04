@@ -1,0 +1,48 @@
+name: chaos
+
+# Chaos tests of Botsight.md, 18.3: faults under load, then ClickHouse must hold every
+# accepted event exactly once. Long (~10 min), so nightly and on demand, and on pull
+# requests that change the tests, the generator or the stack.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+  pull_request:
+    paths: ["loadtest/**", "backend/cmd/loadgen/**", "deploy/docker-compose.yml", ".github/workflows/chaos.yml"]
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: start the stack with toxiproxy
+        run: |
+          for i in 1 2 3 4; do
+            docker compose -f deploy/docker-compose.yml --profile chaos up -d --build api collector chwriter toxiproxy && break
+            sleep $((i * 15))
+          done
+          for port in 8080 8081 8082; do
+            for i in $(seq 1 90); do curl -fsS localhost:$port/readyz > /dev/null && break; sleep 2; done
+          done
+          curl -fsS localhost:8474/version
+      - name: chaos scenarios
+        run: loadtest/chaos.sh
+      - name: report
+        if: always()
+        run: |
+          echo "## Хаос-тесты" >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/botsight-chaos/report.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos
+          path: /tmp/botsight-chaos/*.txt
+          if-no-files-found: ignore
+      - name: logs
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml --profile chaos logs --tail 200 collector chwriter kafka
