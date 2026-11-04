@@ -144,6 +144,9 @@ INGEST_RATE=10000000 INGEST_BURST=10000000 docker compose -f deploy/docker-compo
 | `KEY_CACHE_TTL` | `60s` | сколько ключ живёт в кэше |
 | `KAFKA_CREATE_TOPICS` | `true` | создать недостающие топики при старте |
 | `KAFKA_REPLICATION_FACTOR` | `1` | фактор репликации создаваемых топиков (3 в продакшене) |
+| `COLLECTOR_TRANSACTIONS` | `true` | батч пишется в Kafka транзакцией: потребители видят его целиком или не видят вовсе |
+| `COLLECTOR_TXN_WORKERS` | `4` | параллельных транзакций; каждая собирает батчи одновременных запросов |
+| `COLLECTOR_TXN_LINGER` | `2ms` | сколько группа ждёт следующие батчи перед коммитом |
 
 ## Настройки `chwriter`
 

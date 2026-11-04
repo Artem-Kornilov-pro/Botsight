@@ -26,7 +26,8 @@ func (k KafkaSource) Run(ctx context.Context, deliver func(projectID uint32, val
 		kgo.SeedBrokers(k.Brokers...),
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
-		kgo.FetchMaxWait(250*time.Millisecond), // the dashboard waits for each event
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()), // only committed batches of the collector
+		kgo.FetchMaxWait(250*time.Millisecond),       // the dashboard waits for each event
 	)
 	if err != nil {
 		return err
