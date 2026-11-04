@@ -3,8 +3,12 @@ info:
   title: Botsight API
   version: 0.1.0
   description: |
-    Control plane of the Botsight dashboard (Botsight.md, 13.3): accounts and sign-in,
-    projects, members, API keys, saved funnels and ad spend.
+    API of the Botsight dashboard (Botsight.md, 13.3): accounts and sign-in, projects,
+    members, API keys, saved funnels, ad spend and analytics of the bot's events.
+
+    Analytics endpoints take a period `from`, `to` (dates YYYY-MM-DD in `tz`, `to` inclusive,
+    or RFC 3339 times; by default the last 30 days) and `tz` (IANA, default UTC). Their
+    answers are cached for a minute; the `X-Cache` header is `hit` or `miss`.
 
     Authentication: the `bs_session` cookie (HttpOnly, SameSite=Lax) set on sign-in.
     Every state-changing request of a signed-in user must send the `X-CSRF-Token`
@@ -26,6 +30,7 @@ tags:
   - name: keys
   - name: funnels
   - name: ad-spend
+  - name: analytics
   - name: ai
   - name: antifraud
   - name: health
@@ -584,6 +589,192 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/projects/{projectID}/overview:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [analytics]
+      summary: Audience, blocks, errors and handler time by day (any member)
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/TZ" }
+      responses:
+        "200":
+          description: Totals of the period and a series with every day of it
+          headers: { X-Cache: { $ref: "#/components/headers/XCache" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Overview" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/TooHeavy" }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
+  /v1/projects/{projectID}/fsm-graph:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [analytics]
+      summary: Scenario graph from FSM transitions and retries on steps (any member)
+      description: |
+        The state "" is the entry (no state yet) and the exit (state cleared). Handlers that
+        failed are not transitions. Retries skip the project's `neutral_handlers`.
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/TZ" }
+      responses:
+        "200":
+          description: Graph
+          headers: { X-Cache: { $ref: "#/components/headers/XCache" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Graph" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/TooHeavy" }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
+  /v1/projects/{projectID}/funnels/query:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    post:
+      tags: [analytics]
+      summary: Compute a funnel by its definition (any member)
+      description: |
+        Users who made the steps in this order within the window (ClickHouse `windowFunnel`).
+        With `breakdown: source` also per first deep link label of the users.
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/TZ" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [definition]
+              additionalProperties: false
+              properties:
+                definition: { $ref: "#/components/schemas/FunnelDefinition" }
+      responses:
+        "200":
+          description: Users per step
+          headers: { X-Cache: { $ref: "#/components/headers/XCache" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FunnelResult" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/TooHeavy" }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
+  /v1/projects/{projectID}/sources:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [analytics]
+      summary: Traffic sources by first touch, conversion and cost of a user (any member)
+      description: |
+        Users whose first /start came in the period, by its deep link label. Conversion counts
+        the goal at any time since the start of the period. Spend from ad-spend is counted
+        in proportion to the days of the period; sources with spend and no users are listed too.
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/TZ" }
+        - { name: goal, in: query, schema: { type: string }, example: "custom:purchase", description: "kind:value of a funnel step" }
+      responses:
+        "200":
+          description: Sources, the largest first
+          headers: { X-Cache: { $ref: "#/components/headers/XCache" } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [range, goal, sources]
+                properties:
+                  range: { $ref: "#/components/schemas/Range" }
+                  goal: { oneOf: [{ $ref: "#/components/schemas/FunnelStep" }, { type: "null" }] }
+                  sources: { type: array, items: { $ref: "#/components/schemas/Source" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/TooHeavy" }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
+  /v1/projects/{projectID}/retention:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [analytics]
+      summary: Weekly cohorts by the first update (any member)
+      parameters:
+        - { name: weeks, in: query, schema: { type: integer, minimum: 1, maximum: 26, default: 8 }, description: Cohorts of the last weeks, the current one included }
+        - { $ref: "#/components/parameters/TZ" }
+      responses:
+        "200":
+          description: Cohorts, the oldest first
+          headers: { X-Cache: { $ref: "#/components/headers/XCache" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Retention" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/TooHeavy" }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
+  /v1/projects/{projectID}/errors:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [analytics]
+      summary: Handler exceptions, Bot API errors, slow handlers, unhandled updates (any member)
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/TZ" }
+      responses:
+        "200":
+          description: Errors, the most frequent first
+          headers: { X-Cache: { $ref: "#/components/headers/XCache" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Errors" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/TooHeavy" }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
+  /v1/projects/{projectID}/users/{userID}/timeline:
+    parameters:
+      - { $ref: "#/components/parameters/ProjectID" }
+      - { name: userID, in: path, required: true, schema: { type: string, pattern: "^[1-9][0-9]*$" }, description: Telegram user id or its pseudonym }
+    get:
+      tags: [analytics]
+      summary: Events of one user, newest first (any member)
+      description: Bot API requests are matched by the private chat with the user. One page looks 90 days back from its cursor.
+      parameters:
+        - { name: cursor, in: query, schema: { type: string }, description: next_cursor of the previous page }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200":
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events: { type: array, items: { $ref: "#/components/schemas/TimelineEvent" } }
+                  next_cursor: { type: string, description: Absent on the last page }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/AnalyticsOff" }
+
   /v1/projects/{projectID}/topics:
     parameters: [{ $ref: "#/components/parameters/ProjectID" }]
     get:
@@ -736,8 +927,39 @@ components:
       in: path
       required: true
       schema: { type: integer, minimum: 1 }
+    From:
+      name: from
+      in: query
+      schema: { type: string }
+      description: "Start: a date YYYY-MM-DD in tz or an RFC 3339 time; default 29 days before to"
+    To:
+      name: to
+      in: query
+      schema: { type: string }
+      description: "End: a date YYYY-MM-DD in tz (inclusive) or an RFC 3339 time (exclusive); default now"
+    TZ:
+      name: tz
+      in: query
+      schema: { type: string, default: UTC }
+      example: Europe/Moscow
+      description: IANA time zone of dates and days
+
+  headers:
+    XCache:
+      schema: { type: string, enum: [hit, miss] }
+      description: Whether the answer came from the one-minute cache
 
   responses:
+    TooHeavy:
+      description: "`query_too_heavy`: the query hit the ClickHouse limits; narrow the period"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    AnalyticsOff:
+      description: "`analytics_unavailable`: no ClickHouse configured"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     SignedIn:
       description: The account and the CSRF token; sign-in endpoints also set the `bs_session` cookie
       content:
@@ -798,7 +1020,7 @@ components:
                      invalid_credentials, wrong_password, no_password, no_email, already_verified, invalid_token,
                      telegram_disabled, invalid_telegram_auth, telegram_taken, account_not_found, already_member,
                      last_owner, period_overlap, analytics_unavailable, ai_unavailable, invalid_sql,
-                     query_failed, llm_error, llm_disabled, invalid_question]
+                     query_failed, llm_error, llm_disabled, invalid_question, query_too_heavy]
             message: { type: string }
             field: { type: string, description: The invalid field for validation_failed }
 
@@ -923,6 +1145,234 @@ components:
         definition: { $ref: "#/components/schemas/FunnelDefinition" }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    Range:
+      type: object
+      required: [from, to, tz]
+      description: The period used, after defaults and rounding to minutes
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        tz: { type: string }
+
+    Quantiles:
+      type: object
+      required: [p50, p95, p99]
+      properties:
+        p50: { type: number }
+        p95: { type: number }
+        p99: { type: number }
+
+    Overview:
+      type: object
+      required: [range, users, new_users, wau, mau, blocked, updates, unhandled, handler_errors, api_errors, handler_ms, days, deploys]
+      properties:
+        range: { $ref: "#/components/schemas/Range" }
+        users: { type: integer, description: Users with at least one update in the period }
+        new_users: { type: integer, description: Users whose first update ever is in the period }
+        wau: { type: integer, description: 7 days before the end of the period }
+        mau: { type: integer, description: 30 days before the end of the period }
+        blocked: { type: integer, description: "Users who blocked the bot: 403 bot_blocked or my_chat_member kicked" }
+        updates: { type: integer }
+        unhandled: { type: integer }
+        handler_errors: { type: integer }
+        api_errors: { type: integer }
+        handler_ms: { $ref: "#/components/schemas/Quantiles" }
+        days:
+          type: array
+          description: Every day of the period, zeros included
+          items:
+            type: object
+            required: [day, dau, new_users, blocked, updates, unhandled, handler_errors, api_errors]
+            properties:
+              day: { type: string, format: date }
+              dau: { type: integer }
+              new_users: { type: integer }
+              blocked: { type: integer }
+              updates: { type: integer }
+              unhandled: { type: integer }
+              handler_errors: { type: integer }
+              api_errors: { type: integer }
+        deploys:
+          type: array
+          description: Bot starts, marks on the charts
+          items:
+            type: object
+            required: [ts, sdk_version, framework, framework_version]
+            properties:
+              ts: { type: string, format: date-time }
+              sdk_version: { type: string }
+              framework: { type: string }
+              framework_version: { type: string }
+
+    Graph:
+      type: object
+      required: [range, nodes, edges, retries]
+      properties:
+        range: { $ref: "#/components/schemas/Range" }
+        nodes:
+          type: array
+          items:
+            type: object
+            required: [state, in, out]
+            properties:
+              state: { type: string }
+              in: { type: integer }
+              out: { type: integer }
+        edges:
+          type: array
+          items:
+            type: object
+            required: [from, to, transitions, users, share]
+            properties:
+              from: { type: string }
+              to: { type: string }
+              transitions: { type: integer }
+              users: { type: integer }
+              share: { type: number, description: Of the users who left the from state }
+        retries:
+          type: array
+          items:
+            type: object
+            required: [state, retries, users]
+            properties:
+              state: { type: string }
+              retries: { type: integer }
+              users: { type: integer }
+
+    FunnelStepResult:
+      type: object
+      required: [step, users, from_prev, from_first]
+      properties:
+        step: { $ref: "#/components/schemas/FunnelStep" }
+        users: { type: integer }
+        from_prev: { type: number }
+        from_first: { type: number }
+
+    FunnelResult:
+      type: object
+      required: [range, steps]
+      properties:
+        range: { $ref: "#/components/schemas/Range" }
+        steps: { type: array, items: { $ref: "#/components/schemas/FunnelStepResult" } }
+        breakdown:
+          type: array
+          description: With breakdown source; up to 50 sources, the largest first
+          items:
+            type: object
+            required: [source, steps]
+            properties:
+              source: { type: string }
+              steps: { type: array, items: { $ref: "#/components/schemas/FunnelStepResult" } }
+
+    Source:
+      type: object
+      required: [source, users, converted, conversion, blocked, block_rate, spend_rub, cost_per_user_rub, cost_per_conversion_rub]
+      properties:
+        source: { type: string, description: '"" for /start without a label' }
+        users: { type: integer }
+        converted: { type: integer }
+        conversion: { type: number }
+        blocked: { type: integer }
+        block_rate: { type: number }
+        spend_rub: { type: ["number", "null"] }
+        cost_per_user_rub: { type: ["number", "null"] }
+        cost_per_conversion_rub: { type: ["number", "null"] }
+
+    Retention:
+      type: object
+      required: [weeks, tz, cohorts]
+      properties:
+        weeks: { type: integer }
+        tz: { type: string }
+        cohorts:
+          type: array
+          items:
+            type: object
+            required: [week, users, active, share]
+            properties:
+              week: { type: string, format: date, description: Monday of the cohort }
+              users: { type: integer }
+              active: { type: array, items: { type: integer }, description: "Index 0 is the cohort week; weeks not begun yet are left out" }
+              share: { type: array, items: { type: number } }
+
+    Errors:
+      type: object
+      required: [range, handlers, api, rate_limited, slow, unhandled]
+      properties:
+        range: { $ref: "#/components/schemas/Range" }
+        handlers:
+          type: array
+          items:
+            type: object
+            required: [handler, error, count, users, last_seen]
+            properties:
+              handler: { type: string }
+              error: { type: string }
+              count: { type: integer }
+              users: { type: integer }
+              last_seen: { type: string, format: date-time }
+        api:
+          type: array
+          items:
+            type: object
+            required: [method, code, error, count, chats, last_seen]
+            properties:
+              method: { type: string }
+              code: { type: integer }
+              error: { type: string }
+              count: { type: integer }
+              chats: { type: integer }
+              last_seen: { type: string, format: date-time }
+        rate_limited: { type: integer, description: Bot API answers 429 }
+        slow:
+          type: array
+          description: Handlers with at least 5 calls, the slowest p95 first
+          items:
+            type: object
+            required: [handler, calls, ms, max_ms]
+            properties:
+              handler: { type: string }
+              calls: { type: integer }
+              ms: { $ref: "#/components/schemas/Quantiles" }
+              max_ms: { type: integer }
+        unhandled:
+          type: array
+          items:
+            type: object
+            required: [name, content_type, count, users]
+            properties:
+              name: { type: string }
+              content_type: { type: string }
+              count: { type: integer }
+              users: { type: integer }
+
+    TimelineEvent:
+      type: object
+      required: [event_id, ts, type, name, handled, ok, duration_ms]
+      description: Empty fields are omitted
+      properties:
+        event_id: { type: string, format: uuid }
+        ts: { type: string, format: date-time }
+        type: { type: string, enum: [update, step, outgoing, custom, lifecycle] }
+        name: { type: string }
+        chat_id: { type: integer }
+        content_type: { type: string }
+        command: { type: string }
+        start_param: { type: string }
+        callback_data: { type: string }
+        state: { type: string }
+        handler: { type: string }
+        state_from: { type: string }
+        state_to: { type: string }
+        member_status: { type: string }
+        handled: { type: boolean }
+        ok: { type: boolean }
+        duration_ms: { type: integer }
+        error_code: { type: integer }
+        error: { type: string }
+        props_str: { type: object, additionalProperties: { type: string } }
+        props_num: { type: object, additionalProperties: { type: number } }
 
     AdSpend:
       type: object

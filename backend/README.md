@@ -4,7 +4,7 @@ Go-модуль с сервисами Botsight:
 
 | Сервис | Что делает | Документация |
 |---|---|---|
-| `api` | control plane дашборда на PostgreSQL: регистрация и вход, проекты, участники, API-ключи, сохранённые воронки, расходы на рекламу | разделы 12.4, 13.3, 16.3 [Botsight.md](../Botsight.md), [api/openapi.yaml](api/openapi.yaml) |
+| `api` | API дашборда: регистрация и вход, проекты, участники, API-ключи, сохранённые воронки, расходы на рекламу (PostgreSQL); аналитика событий из ClickHouse — обзор, воронки, источники, удержание, ошибки, граф сценария, таймлайн пользователя | разделы 12.4, 13, 16.3 [Botsight.md](../Botsight.md), [api/openapi.yaml](api/openapi.yaml) |
 | `collector` | принимает батчи событий от SDK (`POST /v1/batch`) и пишет их в Kafka | раздел 10 |
 | `chwriter` | переносит события из Kafka в ClickHouse пачками, без потерь и дублей | раздел 11 |
 | `antifraud` | оценивает долю ботоферм по источникам трафика: признаки пользователей из потока, скоринг раз в минуту, алерты | раздел 15 |
@@ -57,6 +57,16 @@ curl "localhost:8123/?user=botsight&password=botsight&database=botsight" \
   --data-binary "SELECT type, name, count() FROM events GROUP BY type, name FORMAT PrettyCompact"
 ```
 
+И в API аналитики (cookie из `jar` после входа):
+
+```bash
+curl -b jar "localhost:8080/v1/projects/1/overview?tz=Europe/Moscow"
+curl -b jar "localhost:8080/v1/projects/1/sources?goal=custom:purchase"
+curl -b jar -H 'Content-Type: application/json' -H 'X-CSRF-Token: <csrf_token>' \
+  -d '{"definition":{"steps":[{"kind":"command","value":"start"},{"kind":"state","value":"Form:lab"},{"kind":"custom","value":"lab_generated"}],"breakdown":"source"}}' \
+  localhost:8080/v1/projects/1/funnels/query
+```
+
 Вход через Telegram включается переменной `TELEGRAM_BOT_TOKEN` (токен бота, к которому привязан Login Widget):
 
 ```bash
@@ -106,7 +116,7 @@ INGEST_RATE=10000000 INGEST_BURST=10000000 docker compose -f deploy/docker-compo
 | `SMTP_FROM` | `Botsight <no-reply@botsight.ru>` | отправитель писем |
 | `SMTP_USERNAME`, `SMTP_PASSWORD` | пусто | авторизация на SMTP-сервере |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
-| `CLICKHOUSE_ADDR`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | пусто, `botsight`, `default`, пусто | ClickHouse для тем и алертов; без адреса эти эндпоинты отвечают `503` |
+| `CLICKHOUSE_ADDR`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | пусто, `botsight`, `default`, пусто | ClickHouse для аналитики, тем и алертов; без адреса эти эндпоинты отвечают `503` |
 | `AI_URL` | пусто | адрес `ai-worker` для `POST /ask`; пусто — вопросы выключены |
 | `AI_INTERNAL_TOKEN` | пусто | общий с `ai-worker` токен |
 
