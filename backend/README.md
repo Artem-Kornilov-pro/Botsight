@@ -69,6 +69,12 @@ curl -b jar -H 'Content-Type: application/json' -H 'X-CSRF-Token: <csrf_token>' 
   localhost:8080/v1/projects/1/funnels/query
 ```
 
+Живая лента событий (Server-Sent Events):
+
+```bash
+curl -N -b jar localhost:8080/v1/projects/1/live
+```
+
 Вход через Telegram включается переменной `TELEGRAM_BOT_TOKEN` (токен бота, к которому привязан Login Widget):
 
 ```bash
@@ -121,6 +127,7 @@ INGEST_RATE=10000000 INGEST_BURST=10000000 docker compose -f deploy/docker-compo
 | `CLICKHOUSE_ADDR`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD` | пусто, `botsight`, `default`, пусто | ClickHouse для аналитики, тем и алертов; без адреса эти эндпоинты отвечают `503` |
 | `AI_URL` | пусто | адрес `ai-worker` для `POST /ask`; пусто — вопросы выключены |
 | `AI_INTERNAL_TOKEN` | пусто | общий с `ai-worker` токен |
+| `KAFKA_BROKERS` | пусто | брокеры для потока событий `GET /v1/projects/{id}/live`; пусто — эндпоинт отвечает `503` |
 
 ## Настройки `collector`
 

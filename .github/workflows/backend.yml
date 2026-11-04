@@ -111,6 +111,20 @@ jobs:
           curl -fsS -b /tmp/jar "$api/fsm-graph" | jq -e '(.edges | length) > 0'
           curl -fsS -b /tmp/jar "$api/errors" | jq -e '.api | length >= 0'
           curl -fsS -b /tmp/jar "$api/retention?weeks=2" | jq -e '.cohorts[0].users > 0'
+      - name: live stream shows events as they arrive
+        run: |
+          account=$(grep -o 'account [^,]*' /tmp/loadgen.txt | cut -d' ' -f2)
+          pid=$(grep -o "IN ([0-9,]*)" /tmp/loadgen.txt | grep -o '[0-9][0-9]*' | head -1)
+          csrf=$(curl -fsS -c /tmp/jar2 -H 'Content-Type: application/json' \
+            -d "{\"email\":\"$account\",\"password\":\"loadgen-password\"}" localhost:8080/v1/auth/login | jq -r .csrf_token)
+          key=$(curl -fsS -b /tmp/jar2 -H 'Content-Type: application/json' -H "X-CSRF-Token: $csrf" \
+            -d '{"name":"live"}' "localhost:8080/v1/projects/$pid/keys" | jq -r .key)
+          curl -sN -b /tmp/jar2 --max-time 25 "localhost:8080/v1/projects/$pid/live" > /tmp/live.txt &
+          sleep 3
+          (cd backend && go run ./cmd/loadgen -keys "$key" -users 50 -rate 200 -duration 5s)
+          wait || true
+          grep -c '^event: event' /tmp/live.txt
+          grep -q '^event: ready' /tmp/live.txt && grep -q '^event: event' /tmp/live.txt
       - name: logs
         if: failure()
         run: docker compose -f deploy/docker-compose.yml logs --tail 200

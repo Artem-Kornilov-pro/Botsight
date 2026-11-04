@@ -16,6 +16,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/live"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/mail"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/query"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/ratelimit"
@@ -69,6 +70,8 @@ type Deps struct {
 	Logger   *slog.Logger
 	// ClickHouse holds AI topics and alerts; nil turns those endpoints off (503).
 	ClickHouse driver.Conn
+	// Live streams events as they arrive; nil turns /live off (503).
+	Live *live.Hub
 	// HTTPClient calls ai-worker; nil means a client with a 60 s timeout.
 	HTTPClient *http.Client
 	Options    Options
@@ -180,6 +183,7 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/retention", s.retention)
 				r.Get("/errors", s.errorsReport)
 				r.Get("/users/{userID}/timeline", s.timeline)
+				r.Get("/live", s.live)
 				r.Post("/funnels/query", s.queryFunnel) // reads only: any role
 
 				r.Get("/funnels", s.listFunnels)

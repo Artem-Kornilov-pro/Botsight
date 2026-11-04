@@ -775,6 +775,28 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "503": { $ref: "#/components/responses/AnalyticsOff" }
 
+  /v1/projects/{projectID}/live:
+    parameters: [{ $ref: "#/components/parameters/ProjectID" }]
+    get:
+      tags: [analytics]
+      summary: Events of the project as they arrive, Server-Sent Events (any member)
+      description: |
+        A stream from now on, without replay; EventSource reconnects by itself. Events:
+        `ready` (`{"project_id", "heartbeat_seconds"}`) first; `event` with an event as data and
+        its event_id as the SSE id; `dropped` (`{"count"}`) when the client read too slowly and
+        events were skipped. A `: ping` comment comes every 15 seconds.
+      responses:
+        "200":
+          description: The stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+              example: "event: event\nid: 0192f6c8-4d1e-7a3b-9c55-3f1a2b6c7d81\ndata: {\"event_id\":\"0192f6c8-...\",\"type\":\"update\",\"name\":\"message\",\"user_id\":\"123\",\"command\":\"start\"}\n\n"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { description: "`too_many_streams`: open streams of the project or the instance at their limit; see Retry-After", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: "`live_unavailable`: no Kafka configured", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
   /v1/projects/{projectID}/topics:
     parameters: [{ $ref: "#/components/parameters/ProjectID" }]
     get:
@@ -1020,7 +1042,7 @@ components:
                      invalid_credentials, wrong_password, no_password, no_email, already_verified, invalid_token,
                      telegram_disabled, invalid_telegram_auth, telegram_taken, account_not_found, already_member,
                      last_owner, period_overlap, analytics_unavailable, ai_unavailable, invalid_sql,
-                     query_failed, llm_error, llm_disabled, invalid_question, query_too_heavy]
+                     query_failed, llm_error, llm_disabled, invalid_question, query_too_heavy, live_unavailable, too_many_streams]
             message: { type: string }
             field: { type: string, description: The invalid field for validation_failed }
 
