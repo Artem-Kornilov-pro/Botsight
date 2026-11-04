@@ -39,6 +39,17 @@ const sections: Array<{ title?: string; links: Array<{ to: string; label: string
       { to: "live", label: "Живая лента" },
     ],
   },
+  {
+    title: "Аналитика",
+    links: [
+      { to: "funnels", label: "Воронки" },
+      { to: "sources", label: "Источники" },
+      { to: "retention", label: "Удержание" },
+      { to: "scenario", label: "Граф сценария" },
+      { to: "errors", label: "Ошибки" },
+      { to: "user", label: "Пользователь" },
+    ],
+  },
   { title: "Бот", links: [{ to: "connect", label: "Подключение" }] },
 ];
 

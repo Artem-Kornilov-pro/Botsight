@@ -45,6 +45,12 @@ export const router = createBrowserRouter([
         children: [
           // chart pages load ECharts on demand: sign-in and the project list stay light
           { index: true, lazy: () => import("./pages/Overview").then((m) => ({ Component: m.OverviewPage })) },
+          { path: "funnels", lazy: () => import("./pages/Funnels").then((m) => ({ Component: m.FunnelsPage })) },
+          { path: "sources", lazy: () => import("./pages/Sources").then((m) => ({ Component: m.SourcesPage })) },
+          { path: "retention", lazy: () => import("./pages/Retention").then((m) => ({ Component: m.RetentionPage })) },
+          { path: "scenario", lazy: () => import("./pages/Scenario").then((m) => ({ Component: m.ScenarioPage })) },
+          { path: "errors", lazy: () => import("./pages/Errors").then((m) => ({ Component: m.ErrorsPage })) },
+          { path: "user", lazy: () => import("./pages/User").then((m) => ({ Component: m.UserPage })) },
           { path: "live", element: <LivePage /> },
           { path: "connect", element: <ConnectPage /> },
         ],
