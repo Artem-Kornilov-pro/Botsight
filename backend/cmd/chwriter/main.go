@@ -22,6 +22,7 @@ import (
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/clickhouse"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/config"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/kafka"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/tracing"
 )
 
 func main() {
@@ -40,11 +41,24 @@ func run() error {
 	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
 		return err
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	// trace_id in log lines logged with a context (Botsight.md, 17.3)
+	logger := slog.New(tracing.LogHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
 	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	tracer, shutdownTracing, err := tracing.Setup(ctx, "chwriter")
+	if err != nil {
+		return err
+	}
+	defer func() { // after the service stopped: spans of the last batches are flushed too
+		tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(tctx); err != nil {
+			logger.Warn("cannot flush traces", "err", err)
+		}
+	}()
 
 	redisOpts, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
@@ -79,6 +93,7 @@ func run() error {
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	writer, err := chwriter.New(chwriter.Config{
 		Brokers: brokers, Group: cfg.Group, BatchRows: cfg.BatchRows, FlushInterval: cfg.FlushInterval,
+		Tracer: tracer,
 	}, conn, rdb, chwriter.Sinks(), logger, chwriter.NewMetrics(reg))
 	if err != nil {
 		return err

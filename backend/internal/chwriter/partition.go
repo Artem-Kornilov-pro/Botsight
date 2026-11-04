@@ -200,6 +200,8 @@ func (pw *partitionWorker) flush(chunk []*kgo.Record) bool {
 	w, ctx := pw.w, pw.ctx
 	first, last := chunk[0].Offset, chunk[len(chunk)-1].Offset
 	token := fmt.Sprintf("%s/p%d/%d-%d", pw.topic, pw.partition, first, last)
+	tr := pw.startTrace(chunk, token)
+	defer tr.abandon()
 
 	rows := make([][]any, 0, len(chunk))
 	var dlq []*kgo.Record
@@ -236,6 +238,7 @@ func (pw *partitionWorker) flush(chunk []*kgo.Record) bool {
 		if !ok {
 			return false
 		}
+		tr.event("inserted into ClickHouse")
 		w.metrics.InsertDuration.WithLabelValues(pw.sink.Table).Observe(time.Since(started).Seconds())
 		w.metrics.Rows.WithLabelValues(pw.sink.Table).Add(float64(len(rows)))
 		w.metrics.Freshness.WithLabelValues(pw.sink.Table).Observe(time.Since(chunk[0].Timestamp).Seconds())
@@ -252,6 +255,7 @@ func (pw *partitionWorker) flush(chunk []*kgo.Record) bool {
 	if !pw.retry("commit", func() error { return w.cl.CommitRecords(ctx, chunk[len(chunk)-1]) }) {
 		return false
 	}
+	tr.committed()
 
 	pw.mu.Lock()
 	pw.buf = pw.buf[len(chunk):]

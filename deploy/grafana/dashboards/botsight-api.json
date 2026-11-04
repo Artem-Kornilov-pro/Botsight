@@ -16,7 +16,7 @@
   },
   "panels": [
     {
-      "id": 24,
+      "id": 25,
       "type": "stat",
       "title": "Запросов в секунду",
       "description": "",
@@ -72,7 +72,7 @@
       }
     },
     {
-      "id": 25,
+      "id": 26,
       "type": "stat",
       "title": "Аналитика p95",
       "description": "цель < 1 с",
@@ -131,7 +131,7 @@
       }
     },
     {
-      "id": 26,
+      "id": 27,
       "type": "stat",
       "title": "Попадания в кэш, час",
       "description": "",
@@ -187,7 +187,7 @@
       }
     },
     {
-      "id": 27,
+      "id": 28,
       "type": "stat",
       "title": "Потоков /live",
       "description": "",
@@ -242,7 +242,7 @@
       }
     },
     {
-      "id": 28,
+      "id": 29,
       "type": "stat",
       "title": "Доля 5xx",
       "description": "",
@@ -302,7 +302,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 30,
       "type": "stat",
       "title": "Отказы 429",
       "description": "лимиты входа, вопросов AI и потоков",
@@ -358,7 +358,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 31,
       "type": "timeseries",
       "title": "Запросы по маршрутам, топ 10",
       "description": "",
@@ -416,7 +416,7 @@
       }
     },
     {
-      "id": 31,
+      "id": 32,
       "type": "timeseries",
       "title": "p95 по маршрутам, топ 10",
       "description": "",
@@ -474,7 +474,7 @@
       }
     },
     {
-      "id": 32,
+      "id": 33,
       "type": "timeseries",
       "title": "Аналитика: p95 по видам запросов",
       "description": "время в ClickHouse, без попаданий в кэш; линия — цель 1 с",
@@ -545,7 +545,7 @@
       }
     },
     {
-      "id": 33,
+      "id": 34,
       "type": "timeseries",
       "title": "Кэш по видам запросов",
       "description": "",
@@ -603,7 +603,7 @@
       }
     },
     {
-      "id": 34,
+      "id": 35,
       "type": "timeseries",
       "title": "Ответы по кодам",
       "description": "",
@@ -661,7 +661,7 @@
       }
     },
     {
-      "id": 35,
+      "id": 36,
       "type": "timeseries",
       "title": "Потоки /live",
       "description": "",

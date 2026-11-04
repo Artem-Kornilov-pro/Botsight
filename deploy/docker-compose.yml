@@ -162,6 +162,10 @@ services:
       INGEST_RATE: ${INGEST_RATE:-2000}   # events per second per project
       INGEST_BURST: ${INGEST_BURST:-20000}
       LOG_LEVEL: info
+      # Tracing (Botsight.md, 17.3): a share of batches is traced end to end.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318} # empty: tracing off
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
+      OTEL_TRACES_SAMPLER_ARG: ${TRACE_RATIO:-0.05}
     ports:
       - "127.0.0.1:8081:8081"
     depends_on:
@@ -184,6 +188,8 @@ services:
       CLICKHOUSE_USER: botsight
       CLICKHOUSE_PASSWORD: botsight
       LOG_LEVEL: info
+      # ch-writer follows the collector's decision: it traces only batches that carry a traceparent
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://jaeger:4318} # empty: tracing off
     ports:
       - "127.0.0.1:8082:8082"
     depends_on:
@@ -290,6 +296,15 @@ services:
     ports:
       - "127.0.0.1:9090:9090"
 
+  # Traces of batches from the collector to ClickHouse (Botsight.md, 17.3); in-memory, local only.
+  # 2.20: from 2.21 Jaeger serves only the /api/v3 query API, and the Jaeger data source
+  # of Grafana 12.1 still uses /api/services and /api/traces.
+  jaeger:
+    image: jaegertracing/jaeger:2.20.0
+    ports:
+      - "127.0.0.1:16686:16686" # UI
+      - "127.0.0.1:4318:4318"   # OTLP/HTTP, for services run outside compose
+
   grafana:
     image: grafana/grafana:12.1.0
     environment:
@@ -304,6 +319,7 @@ services:
       - "127.0.0.1:3000:3000"
     depends_on:
       - prometheus
+      - jaeger
 
 volumes:
   postgres-data:

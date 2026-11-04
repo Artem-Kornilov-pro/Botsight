@@ -33,6 +33,7 @@ docker compose -f deploy/docker-compose.yml up --build
 | http://localhost:8025 | Mailpit: письма подтверждения почты и сброса пароля |
 | http://localhost:9090 | Prometheus: метрики всех сервисов, SLO-алерты (`deploy/prometheus`) |
 | http://localhost:3000 | Grafana: дашборды «Приём и конвейер», «API и аналитика», «SLO» (анонимный просмотр; admin / botsight) |
+| http://localhost:16686 | Jaeger: трейсы батчей от collector до коммита в ch-writer (их же видно в Grafana, Explore → Jaeger) |
 | http://localhost:8123 | ClickHouse (HTTP), база `botsight`, пользователь и пароль `botsight` |
 | localhost:9094 | Kafka |
 | localhost:5432 | PostgreSQL, база `botsight`, пользователь и пароль `botsight` |
@@ -219,6 +220,8 @@ docker run --rm -v "$PWD/deploy/prometheus:/p" -w /p --entrypoint promtool prom/
 ```
 
 `api` отдаёт `/metrics`: запросы по шаблону маршрута, `botsight_query_duration_seconds{kind}`, `botsight_query_cache_total{kind,result}`, `botsight_live_streams`. ch-writer — свежесть `botsight_ch_freshness_seconds`.
+
+Трассировка (OpenTelemetry, Botsight.md, 17.3) включается стандартными переменными: `OTEL_EXPORTER_OTLP_ENDPOINT` — куда слать спаны по OTLP/HTTP, `OTEL_TRACES_SAMPLER` и `OTEL_TRACES_SAMPLER_ARG` — какую долю батчей трассировать. В compose это Jaeger и 5 % батчей (`TRACE_RATIO=1` — все); `OTEL_EXPORTER_OTLP_ENDPOINT=` выключает трассировку. Строки логов с контекстом запроса несут `trace_id`.
 
 ## Миграции
 

@@ -17,9 +17,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/event"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/kafka"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/tracing"
 )
 
 // Producer is the part of *kgo.Client the collector uses.
@@ -51,6 +57,7 @@ type Collector struct {
 	cfg      Config
 	// broadcasts serves the SDK's broadcast work; nil turns the endpoints off
 	broadcasts *Broadcasts
+	tracer     trace.Tracer
 
 	inflight chan struct{}
 	shutting atomic.Bool
@@ -70,6 +77,8 @@ type Deps struct {
 	Ready      func(context.Context) error
 	Config     Config
 	Broadcasts *Broadcasts
+	// Tracer traces every batch (Botsight.md, 17.3); nil turns tracing off.
+	Tracer trace.TracerProvider
 }
 
 func New(d Deps) *Collector {
@@ -79,9 +88,13 @@ func New(d Deps) *Collector {
 	if d.Config.ProduceTimeout <= 0 {
 		d.Config.ProduceTimeout = 15 * time.Second
 	}
+	if d.Tracer == nil {
+		d.Tracer = noop.NewTracerProvider()
+	}
 	return &Collector{
 		keys: d.Keys, gate: d.Gate, producer: d.Producer, bots: d.Bots, log: d.Logger,
 		metrics: d.Metrics, gatherer: d.Gatherer, ready: d.Ready, cfg: d.Config, broadcasts: d.Broadcasts,
+		tracer:   d.Tracer.Tracer("github.com/Artem-Kornilov-pro/Botsight/backend/internal/ingest"),
 		inflight: make(chan struct{}, d.Config.MaxInflight),
 		now:      time.Now,
 	}
@@ -131,10 +144,19 @@ type batchResponse struct {
 
 func (c *Collector) handleBatch(w http.ResponseWriter, r *http.Request) {
 	started := c.now()
+	// One trace per batch; it continues in ch-writer through the Kafka headers.
+	ctx, span := c.tracer.Start(tracing.FromHTTP(r.Context(), propagation.HeaderCarrier(r.Header)),
+		"POST /v1/batch", trace.WithSpanKind(trace.SpanKindServer))
+	r = r.WithContext(ctx)
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	defer func() {
 		c.metrics.Requests.WithLabelValues(strconv.Itoa(rec.status)).Inc()
 		c.metrics.Duration.Observe(time.Since(started).Seconds())
+		span.SetAttributes(attribute.Int("http.response.status_code", rec.status))
+		if rec.status >= 500 {
+			span.SetStatus(codes.Error, http.StatusText(rec.status))
+		}
+		span.End()
 	}()
 	w = rec
 
@@ -155,13 +177,13 @@ func (c *Collector) handleBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authorization: Bearer <api key> required")
 		return
 	}
-	project, err := c.keys.Lookup(r.Context(), strings.TrimSpace(key))
+	project, err := c.keys.Lookup(ctx, strings.TrimSpace(key))
 	if errors.Is(err, ErrInvalidKey) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "invalid or revoked API key")
 		return
 	}
 	if err != nil {
-		c.log.Error("key lookup failed", "err", err)
+		c.log.ErrorContext(ctx, "key lookup failed", "err", err)
 		w.Header().Set("Retry-After", "5")
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "cannot check the API key now")
 		return
@@ -186,15 +208,20 @@ func (c *Collector) handleBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	span.SetAttributes(attribute.Int("botsight.project_id", int(project.ID)),
+		attribute.String("botsight.batch_id", batch.BatchID), attribute.Int("botsight.events", len(batch.Events)))
 
 	// 3. Dedup and rate limit, one Redis call.
-	gate, err := c.gate.Admit(r.Context(), project.ID, batch.BatchID, len(batch.Events))
+	gctx, gspan := c.tracer.Start(ctx, "redis gate", trace.WithSpanKind(trace.SpanKindClient))
+	gate, err := c.gate.Admit(gctx, project.ID, batch.BatchID, len(batch.Events))
+	endSpan(gspan, err)
 	if err != nil {
-		c.log.Error("redis gate failed", "err", err)
+		c.log.ErrorContext(ctx, "redis gate failed", "err", err)
 		w.Header().Set("Retry-After", "5")
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "temporarily unavailable")
 		return
 	}
+	span.SetAttributes(attribute.String("botsight.admission", gate.Admission.String()))
 	switch gate.Admission {
 	case Duplicate:
 		c.metrics.Duplicates.Inc()
@@ -211,17 +238,24 @@ func (c *Collector) handleBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Validate, normalize, split texts.
-	records, accepted, rejected, botID := c.buildRecords(project, batch)
+	_, bspan := c.tracer.Start(ctx, "build records")
+	records, accepted, rejected, botID := c.buildRecords(ctx, project, batch)
+	bspan.End()
 	c.metrics.Events.WithLabelValues("accepted").Add(float64(accepted))
 	c.metrics.Events.WithLabelValues("rejected").Add(float64(rejected))
+	span.SetAttributes(attribute.Int("botsight.accepted", accepted), attribute.Int("botsight.rejected", rejected))
 
 	// 5. Kafka: answer 202 only after every record is acknowledged. The produce context is
 	// detached from the client so a disconnect cannot leave records half-written.
-	pctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), c.cfg.ProduceTimeout)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.ProduceTimeout)
 	defer cancel()
-	if err := c.producer.ProduceSync(pctx, records...).FirstErr(); err != nil {
+	pctx, pspan := c.tracer.Start(pctx, "kafka produce", trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(attribute.Int("messaging.batch.message_count", len(records))))
+	err = c.producer.ProduceSync(pctx, records...).FirstErr()
+	endSpan(pspan, err)
+	if err != nil {
 		c.metrics.ProduceErrors.Inc()
-		c.log.Error("kafka produce failed", "project_id", project.ID, "err", err)
+		c.log.ErrorContext(ctx, "kafka produce failed", "project_id", project.ID, "err", err)
 		if rerr := c.gate.Release(context.WithoutCancel(r.Context()), project.ID, batch.BatchID); rerr != nil {
 			c.log.Warn("failed to release batch key", "err", rerr)
 		}
@@ -246,7 +280,7 @@ func (c *Collector) handleBatch(w http.ResponseWriter, r *http.Request) {
 // are appended to one buffer, and the records live in one slice, so a batch of 500 events
 // costs a few allocations instead of three per event. Values are capped 3-index slices of
 // the buffer: a later append never writes into an earlier record.
-func (c *Collector) buildRecords(project Project, batch *event.Batch) (records []*kgo.Record, accepted, rejected int, botID int64) {
+func (c *Collector) buildRecords(ctx context.Context, project Project, batch *event.Batch) (records []*kgo.Record, accepted, rejected int, botID int64) {
 	receivedAt := c.now().UTC()
 	norm := event.NewNormalizer(uint32(project.ID), batch, receivedAt)
 	n := len(batch.Events) + 1
@@ -261,10 +295,12 @@ func (c *Collector) buildRecords(project Project, batch *event.Batch) (records [
 	}
 	arena := make([]byte, 0, len(batch.Events)*arenaPerEvent)
 	cut := func(start int) []byte { return arena[start:len(arena):len(arena)] }
-	headers := []kgo.RecordHeader{
+	// Headers are shared by all records of the batch, so the trace context costs one
+	// header per batch, not per event; only sampled batches carry it.
+	headers := tracing.Inject(ctx, []kgo.RecordHeader{
 		{Key: "project_id", Value: []byte(strconv.Itoa(int(project.ID)))},
 		{Key: "schema_version", Value: []byte(strconv.Itoa(event.SchemaVersion))},
-	}
+	})
 	for _, raw := range batch.Events {
 		rec, text, err := norm.Normalize(raw)
 		if err != nil {
@@ -307,6 +343,14 @@ func (c *Collector) buildRecords(project Project, batch *event.Batch) (records [
 // arenaPerEvent is the buffer reserved per event: a typical encoded event with its key
 // is 300-450 bytes; a bigger batch grows the buffer once or twice.
 const arenaPerEvent = 448
+
+func endSpan(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
+}
 
 func (c *Collector) recordBotID(project Project, botID int64) {
 	c.keys.MarkBotIDKnown(project.Prefix)

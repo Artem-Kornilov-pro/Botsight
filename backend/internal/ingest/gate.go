@@ -34,6 +34,20 @@ const (
 	Limited              // over the project's rate; see RetryAfter
 )
 
+func (a Admission) String() string {
+	switch a {
+	case Admitted:
+		return "admitted"
+	case Duplicate:
+		return "duplicate"
+	case InProgress:
+		return "in_progress"
+	case Limited:
+		return "limited"
+	}
+	return "unknown"
+}
+
 type GateResult struct {
 	Admission  Admission
 	Accepted   int

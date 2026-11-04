@@ -22,6 +22,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/auth"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/event"
@@ -29,6 +32,7 @@ import (
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/kafka"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/store"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/testenv"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/tracing"
 )
 
 var (
@@ -84,6 +88,7 @@ type options struct {
 	producer    ingest.Producer
 	captureText bool
 	broadcasts  *ingest.Broadcasts
+	tracer      trace.TracerProvider
 }
 
 var accountSeq atomic.Int64
@@ -127,6 +132,7 @@ func newHarness(t *testing.T, o options) *harness {
 		Ready:      func(ctx context.Context) error { return env.Redis.Ping(ctx).Err() },
 		Config:     ingest.Config{MaxInflight: o.maxInflight},
 		Broadcasts: o.broadcasts,
+		Tracer:     o.tracer,
 	})
 	srv := httptest.NewServer(c.Handler())
 	t.Cleanup(func() {
@@ -540,6 +546,89 @@ func TestHealthAndMetrics(t *testing.T) {
 		}
 		if path == "/metrics" && !bytes.Contains(b, []byte("botsight_ingest_duration_seconds")) {
 			t.Fatal("metrics missing")
+		}
+	}
+}
+
+// capturingProducer keeps what the collector produced.
+type capturingProducer struct {
+	ingest.Producer
+	mu   sync.Mutex
+	recs []*kgo.Record
+}
+
+func (p *capturingProducer) ProduceSync(ctx context.Context, rs ...*kgo.Record) kgo.ProduceResults {
+	p.mu.Lock()
+	p.recs = append(p.recs, rs...)
+	p.mu.Unlock()
+	return p.Producer.ProduceSync(ctx, rs...)
+}
+
+// TestBatchTrace checks Botsight.md, 17.3 on the collector side: a batch is one trace
+// (continuing the client's traceparent if it sent one), its steps are child spans, and
+// every record of the batch carries the trace context to ch-writer.
+func TestBatchTrace(t *testing.T) {
+	spans := tracetest.NewSpanRecorder()
+	cp := &capturingProducer{Producer: producer}
+	h := newHarness(t, options{producer: cp, tracer: sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans))})
+
+	client := "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	body, _ := json.Marshal(sdkBatch(sdkEvent(nil), sdkEvent(map[string]any{"type": "custom", "name": "paid"})))
+	if r := h.post(gz(body), map[string]string{"traceparent": client}); r.status != http.StatusAccepted {
+		t.Fatalf("%d %v", r.status, r.body)
+	}
+
+	// the batch span ends after the response is written
+	var root sdktrace.ReadOnlySpan
+	children := map[string]sdktrace.ReadOnlySpan{}
+	for deadline := time.Now().Add(5 * time.Second); root == nil && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		for _, s := range spans.Ended() {
+			if s.Name() == "POST /v1/batch" {
+				root = s
+			} else {
+				children[s.Name()] = s
+			}
+		}
+	}
+	if root == nil || root.SpanKind() != trace.SpanKindServer {
+		t.Fatalf("no server span: %v", spans.Ended())
+	}
+	if root.Parent().TraceID().String() != "4bf92f3577b34da6a3ce929d0e0e4736" || root.Parent().SpanID().String() != "00f067aa0ba902b7" {
+		t.Fatalf("client traceparent not continued: parent %v", root.Parent())
+	}
+	attrs := map[string]string{}
+	for _, a := range root.Attributes() {
+		attrs[string(a.Key)] = a.Value.Emit()
+	}
+	if attrs["botsight.project_id"] != strconv.Itoa(int(h.project.ID)) || attrs["botsight.accepted"] != "2" ||
+		attrs["botsight.admission"] != "admitted" || attrs["http.response.status_code"] != "202" {
+		t.Fatalf("root attributes %v", attrs)
+	}
+	for _, name := range []string{"redis gate", "build records", "kafka produce"} {
+		if c := children[name]; c == nil || c.Parent().SpanID() != root.SpanContext().SpanID() {
+			t.Fatalf("%q is not a child of the batch span: %v", name, children)
+		}
+	}
+
+	if len(cp.recs) != 3 { // 2 events + the batch meta
+		t.Fatalf("records %d", len(cp.recs))
+	}
+	for _, r := range cp.recs {
+		sc := trace.SpanContextFromContext(tracing.Extract(context.Background(), r.Headers))
+		if sc.TraceID() != root.SpanContext().TraceID() || sc.SpanID() != root.SpanContext().SpanID() {
+			t.Fatalf("%s record carries %v, want the batch span", r.Topic, sc)
+		}
+	}
+
+	// without tracing records carry no traceparent
+	plain := newHarness(t, options{producer: cp})
+	cp.recs = nil
+	if r := plain.send(sdkBatch(sdkEvent(nil))); r.status != http.StatusAccepted {
+		t.Fatal(r.status)
+	}
+	for _, r := range cp.recs {
+		if tracing.TraceParent(r.Headers) != nil {
+			t.Fatal("traceparent written with tracing off")
 		}
 	}
 }
