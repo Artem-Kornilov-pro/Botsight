@@ -3,9 +3,9 @@ name: backend
 on:
   push:
     branches: [main]
-    paths: ["backend/**", "ai/**", "migrations/**", "deploy/**", "docs/contract/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "ai/**", "migrations/**", "deploy/**", "docs/contract/**", "web/**", ".github/workflows/backend.yml"]
   pull_request:
-    paths: ["backend/**", "ai/**", "migrations/**", "deploy/**", "docs/contract/**", ".github/workflows/backend.yml"]
+    paths: ["backend/**", "ai/**", "migrations/**", "deploy/**", "docs/contract/**", "web/**", ".github/workflows/backend.yml"]
 
 jobs:
   test:
@@ -125,6 +125,27 @@ jobs:
           wait || true
           grep -c '^event: event' /tmp/live.txt
           grep -q '^event: ready' /tmp/live.txt && grep -q '^event: event' /tmp/live.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: dashboard end-to-end (Playwright against the running stack)
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run build
+          npx vite preview --port 4173 --strictPort > /tmp/preview.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS localhost:4173 > /dev/null && break; sleep 1; done
+          E2E_EMAIL=$(grep -o 'account [^,]*' /tmp/loadgen.txt | cut -d' ' -f2) npx playwright test
+      - name: Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report
+          if-no-files-found: ignore
       - name: logs
         if: failure()
         run: docker compose -f deploy/docker-compose.yml logs --tail 200

@@ -37,9 +37,8 @@ flowchart LR
 | `api` | аккаунты, проекты, ключи (PostgreSQL); аналитика из ClickHouse — обзор, воронки (`windowFunnel`), источники и стоимость пользователя, когорты (`retention`), ошибки, граф FSM, таймлайн; живая лента событий по SSE из Kafka; рассылки по сегментам | [backend/internal/httpapi](backend/internal/httpapi), [backend/internal/query](backend/internal/query), [OpenAPI](backend/api/openapi.yaml) |
 | `botproxy` | шлюз к Bot API для ботов без SDK: поток без буферизации, long polling, вебхуки, дедупликация апдейтов | [backend/internal/botproxy](backend/internal/botproxy) |
 | `antifraud` | доля ботоферм по источникам: признаки пользователей из потока, скоринг, реферальный граф | [backend/internal/antifraud](backend/internal/antifraud) |
+| Дашборд | React + TypeScript: вход, проекты, подключение бота с ожиданием первого события по SSE, обзор, живая лента; типы API генерируются из OpenAPI | [web](web) |
 | `ai-worker` | темы сообщений (эмбеддинги + HDBSCAN), вопросы на естественном языке → проверенный SQL, объяснение аномалий | [ai](ai) |
-
-Дашборд на React — следующий этап.
 
 ## Инженерные решения
 
@@ -70,11 +69,12 @@ cd backend && go run ./cmd/loadgen -projects 3 -users 500 -rate 3000 -duration 3
 cd backend && go test -race ./...     # Go; интеграционные тесты используют Docker
 cd sdk/python && pytest               # SDK
 cd ai && pytest                       # ai-worker
+cd web && npm test                    # дашборд; npm run e2e — Playwright против стека
 ```
 
 ## Стек
 
-Go 1.26 (chi, franz-go, clickhouse-go, pgx, go-redis, Prometheus), Python 3.12 (aiogram 3, FastAPI, fastembed, scikit-learn), Kafka 4 (KRaft), ClickHouse 25.8, PostgreSQL 17, Redis 7, Qdrant, Docker Compose, GitHub Actions.
+React + TypeScript (Vite, TanStack Query, ECharts, Playwright), Go 1.26 (chi, franz-go, clickhouse-go, pgx, go-redis, Prometheus), Python 3.12 (aiogram 3, FastAPI, fastembed, scikit-learn), Kafka 4 (KRaft), ClickHouse 25.8, PostgreSQL 17, Redis 7, Qdrant, Docker Compose, GitHub Actions.
 
 ## Лицензия
 
