@@ -33,6 +33,7 @@ type API struct {
 	ClickHousePassword string // CLICKHOUSE_PASSWORD
 	AIURL              string // AI_URL of ai-worker for /ask; empty turns questions off
 	AIInternalToken    string // AI_INTERNAL_TOKEN shared with ai-worker
+	KafkaBrokers       string // KAFKA_BROKERS for the live stream of events; empty turns /live off
 }
 
 func LoadAPI() (API, error) {
@@ -54,6 +55,7 @@ func LoadAPI() (API, error) {
 		ClickHousePassword: os.Getenv("CLICKHOUSE_PASSWORD"),
 		AIURL:              strings.TrimRight(os.Getenv("AI_URL"), "/"),
 		AIInternalToken:    os.Getenv("AI_INTERNAL_TOKEN"),
+		KafkaBrokers:       os.Getenv("KAFKA_BROKERS"),
 	}
 	var err error
 	if c.CookieSecure, err = envBool("COOKIE_SECURE", true); err != nil {

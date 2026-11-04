@@ -18,6 +18,8 @@ import (
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/clickhouse"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/config"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/httpapi"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/kafka"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/live"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/mail"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/ratelimit"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/session"
@@ -84,6 +86,13 @@ func run() error {
 		logger.Warn("CLICKHOUSE_ADDR is not set: topics and alerts endpoints are disabled")
 	}
 
+	var hub *live.Hub
+	if cfg.KafkaBrokers != "" {
+		hub = live.NewHub(live.KafkaSource{Brokers: kafka.Brokers(cfg.KafkaBrokers)}, logger)
+	} else {
+		logger.Warn("KAFKA_BROKERS is not set: the live stream of events is disabled")
+	}
+
 	srv := httpapi.New(httpapi.Deps{
 		Store:      store.New(pool),
 		Sessions:   session.NewStore(rdb, cfg.SessionTTL),
@@ -92,6 +101,7 @@ func run() error {
 		Mailer:     mailer,
 		Logger:     logger,
 		ClickHouse: ch,
+		Live:       hub,
 		Options: httpapi.Options{
 			DashboardURL:  cfg.DashboardURL,
 			CORSOrigins:   cfg.CORSOrigins,
@@ -132,6 +142,9 @@ func run() error {
 	// wait for background emails, then close connections.
 	logger.Info("shutting down")
 	srv.SetReady(false)
+	if hub != nil {
+		hub.Close() // ends open live streams, or Shutdown would wait for them
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
