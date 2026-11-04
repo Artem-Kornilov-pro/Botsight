@@ -4,6 +4,7 @@
 package event
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -295,43 +296,67 @@ func (n *Normalizer) props(rec *Record, props map[string]json.RawMessage) {
 		if k == "" || utf8.RuneCountInString(k) > maxPropKeyRunes {
 			continue
 		}
-		var s string
-		var f float64
-		var b bool
-		switch {
-		case json.Unmarshal(v, &s) == nil:
+		// The batch is already valid JSON, so the first byte tells the type. Trying string,
+		// then number, then bool with json.Unmarshal built an error for every number.
+		v = bytes.TrimSpace(v)
+		if len(v) == 0 {
+			continue
+		}
+		switch c := v[0]; {
+		case c == '"':
+			str, ok := jsonString(v)
+			if !ok {
+				continue
+			}
 			if rec.PropsStr == nil {
 				rec.PropsStr = map[string]string{}
 			}
-			rec.PropsStr[k] = truncate(s, maxPropStrRunes)
-		case json.Unmarshal(v, &f) == nil && !math.IsInf(f, 0) && !math.IsNaN(f):
+			rec.PropsStr[k] = truncate(str, maxPropStrRunes)
+		case c == '-' || c >= '0' && c <= '9':
+			f, err := strconv.ParseFloat(string(v), 64)
+			if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
+				continue
+			}
 			if rec.PropsNum == nil {
 				rec.PropsNum = map[string]float64{}
 			}
 			rec.PropsNum[k] = f
-		case json.Unmarshal(v, &b) == nil:
+		case c == 't' || c == 'f' || c == 'n':
+			// null has always been stored as "" (json.Unmarshal of null into a string is
+			// a no-op that succeeds), and stored data keeps that meaning.
 			if rec.PropsStr == nil {
 				rec.PropsStr = map[string]string{}
 			}
-			rec.PropsStr[k] = strconv.FormatBool(b)
-		default:
+			s := ""
+			if c != 'n' {
+				s = strconv.FormatBool(c == 't')
+			}
+			rec.PropsStr[k] = s
+		default: // objects and arrays are not props
 			continue
 		}
 		count++
 	}
 }
 
+// jsonString decodes a JSON string literal. Without escapes it is the bytes between the
+// quotes, as long as they are valid UTF-8 (json.Unmarshal replaces invalid bytes).
+func jsonString(v []byte) (string, bool) {
+	if len(v) >= 2 {
+		inner := v[1 : len(v)-1]
+		if bytes.IndexByte(inner, '\\') < 0 && utf8.Valid(inner) {
+			return string(inner), true
+		}
+	}
+	var s string
+	return s, json.Unmarshal(v, &s) == nil
+}
+
 // Key is the Kafka key of an event: project and user keep one user's events ordered in
 // one partition and spread big projects over all partitions (Botsight.md, 11.1).
 // Events without a user (outgoing requests) use the chat, which equals the user in private chats.
 func Key(projectID uint32, userID uint64, chatID int64) []byte {
-	b := make([]byte, 0, 24)
-	b = strconv.AppendUint(b, uint64(projectID), 10)
-	b = append(b, ':')
-	if userID == 0 && chatID != 0 {
-		return strconv.AppendInt(b, chatID, 10)
-	}
-	return strconv.AppendUint(b, userID, 10)
+	return AppendKey(make([]byte, 0, 24), projectID, userID, chatID)
 }
 
 // IsUUID checks the canonical 8-4-4-4-12 hex form.

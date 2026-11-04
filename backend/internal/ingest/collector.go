@@ -241,10 +241,26 @@ func (c *Collector) handleBatch(w http.ResponseWriter, r *http.Request) {
 
 // buildRecords turns a batch into Kafka records: events, texts (only if the project
 // collects them, Botsight.md, 9.4) and one ingest.batches record with SDK metadata.
+//
+// It is the hot path of every request (Botsight.md, 10.5): values and keys of all events
+// are appended to one buffer, and the records live in one slice, so a batch of 500 events
+// costs a few allocations instead of three per event. Values are capped 3-index slices of
+// the buffer: a later append never writes into an earlier record.
 func (c *Collector) buildRecords(project Project, batch *event.Batch) (records []*kgo.Record, accepted, rejected int, botID int64) {
 	receivedAt := c.now().UTC()
 	norm := event.NewNormalizer(uint32(project.ID), batch, receivedAt)
-	records = make([]*kgo.Record, 0, len(batch.Events)+1)
+	n := len(batch.Events) + 1
+	if project.CaptureText {
+		n += len(batch.Events)
+	}
+	records = make([]*kgo.Record, 0, n)
+	pool := make([]kgo.Record, 0, n)
+	newRecord := func(r kgo.Record) *kgo.Record {
+		pool = append(pool, r) // never grows past n, so earlier pointers stay valid
+		return &pool[len(pool)-1]
+	}
+	arena := make([]byte, 0, len(batch.Events)*arenaPerEvent)
+	cut := func(start int) []byte { return arena[start:len(arena):len(arena)] }
 	headers := []kgo.RecordHeader{
 		{Key: "project_id", Value: []byte(strconv.Itoa(int(project.ID)))},
 		{Key: "schema_version", Value: []byte(strconv.Itoa(event.SchemaVersion))},
@@ -255,16 +271,20 @@ func (c *Collector) buildRecords(project Project, batch *event.Batch) (records [
 			rejected++
 			continue
 		}
-		value, err := json.Marshal(rec)
-		if err != nil {
+		start := len(arena)
+		if arena, err = rec.AppendJSON(arena); err != nil {
+			arena = arena[:start]
 			rejected++
 			continue
 		}
-		key := event.Key(rec.ProjectID, rec.UserID, rec.ChatID)
-		records = append(records, &kgo.Record{Topic: kafka.TopicEvents, Key: key, Value: value, Headers: headers})
+		value := cut(start)
+		start = len(arena)
+		arena = event.AppendKey(arena, rec.ProjectID, rec.UserID, rec.ChatID)
+		key := cut(start)
+		records = append(records, newRecord(kgo.Record{Topic: kafka.TopicEvents, Key: key, Value: value, Headers: headers}))
 		if text != nil && project.CaptureText {
 			if tv, err := json.Marshal(text); err == nil {
-				records = append(records, &kgo.Record{Topic: kafka.TopicTexts, Key: key, Value: tv, Headers: headers})
+				records = append(records, newRecord(kgo.Record{Topic: kafka.TopicTexts, Key: key, Value: tv, Headers: headers}))
 			}
 		}
 		if botID == 0 {
@@ -278,11 +298,15 @@ func (c *Collector) buildRecords(project Project, batch *event.Batch) (records [
 		Framework: limit(batch.SDK.Framework, 64), FrameworkVersion: limit(batch.SDK.FrameworkVersion, 32),
 		Events: uint32(accepted), Rejected: uint32(rejected), Dropped: uint32(min(batch.Dropped, 1<<31)),
 	})
-	records = append(records, &kgo.Record{
+	records = append(records, newRecord(kgo.Record{
 		Topic: kafka.TopicBatches, Key: []byte(strconv.Itoa(int(project.ID))), Value: meta, Headers: headers,
-	})
+	}))
 	return records, accepted, rejected, botID
 }
+
+// arenaPerEvent is the buffer reserved per event: a typical encoded event with its key
+// is 300-450 bytes; a bigger batch grows the buffer once or twice.
+const arenaPerEvent = 448
 
 func (c *Collector) recordBotID(project Project, botID int64) {
 	c.keys.MarkBotIDKnown(project.Prefix)
