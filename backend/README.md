@@ -21,7 +21,13 @@ AI-модуль (`ai-worker`) написан на Python и лежит в [`../a
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-Команду запускайте из корня репозитория. Поднимутся PostgreSQL, Redis, Mailpit, Kafka и ClickHouse, применятся миграции из `migrations/postgres/` и `migrations/clickhouse/`, запустятся `api`, `collector` и `chwriter`.
+Команду запускайте из корня репозитория. Поднимутся:
+- PostgreSQL, Redis, Mailpit, Kafka, ClickHouse и Qdrant;
+- миграции из `migrations/postgres/` и `migrations/clickhouse/`;
+- сервисы `api`, `collector`, `chwriter`, `antifraud`, `botproxy` и `ai-worker`;
+- Prometheus, Grafana и Jaeger.
+
+Дашборд запускается отдельно (`cd web && npm run dev`). Как устроена система — в [docs/architecture.md](../docs/architecture.md), алерты и эксплуатация — в [docs/operations.md](../docs/operations.md).
 
 | Адрес | Что там |
 |---|---|
@@ -30,6 +36,7 @@ docker compose -f deploy/docker-compose.yml up --build
 | http://localhost:8082 | ch-writer: `/readyz`, `/metrics` |
 | http://localhost:8083 | antifraud: `/readyz`, `/metrics` |
 | http://localhost:8084 | botproxy: Bot API по адресу `/k/<api_key>`, `/readyz`, `/metrics` |
+| http://localhost:8090 | ai-worker: внутренний API для `api`, `/metrics` |
 | http://localhost:8025 | Mailpit: письма подтверждения почты и сброса пароля |
 | http://localhost:9090 | Prometheus: метрики всех сервисов, SLO-алерты (`deploy/prometheus`) |
 | http://localhost:3000 | Grafana: дашборды «Приём и конвейер», «API и аналитика», «SLO» (анонимный просмотр; admin / botsight) |
@@ -38,6 +45,7 @@ docker compose -f deploy/docker-compose.yml up --build
 | localhost:9094 | Kafka |
 | localhost:5432 | PostgreSQL, база `botsight`, пользователь и пароль `botsight` |
 | localhost:6379 | Redis |
+| localhost:6333 | Qdrant |
 
 Пример: регистрация и создание проекта.
 

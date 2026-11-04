@@ -3,7 +3,15 @@
 Аналитика Telegram-ботов на Go: откуда приходят пользователи, кто блокирует бота, какие хендлеры медленные и падают, какие ошибки возвращает Bot API. SDK работает внутри процесса бота и отправляет только события: токен бота не покидает процесс. Если Botsight недоступен, бот работает как обычно.
 
 ```bash
-go get github.com/Artem-Kornilov-pro/Botsight/sdk/go
+go get github.com/Artem-Kornilov-pro/Botsight/sdk/go@v0.1.0
+```
+
+Модуль лежит в подкаталоге репозитория, поэтому его версии — теги вида `sdk/go/v0.1.0`. Нужен Go 1.24 или новее.
+
+Hosted-версии Botsight пока нет. При самостоятельном развёртывании ([быстрый старт](https://github.com/Artem-Kornilov-pro/Botsight#быстрый-старт)) передайте адрес своего collector:
+
+```go
+bs, _ := botsight.New(os.Getenv("BOTSIGHT_KEY"), gotelegrambot.Framework(), botsight.WithEndpoint("http://localhost:8081"))
 ```
 
 ## go-telegram/bot — три опции
@@ -56,3 +64,11 @@ go test -race ./...
 ```
 
 Ядро проверяется против фейковых Telegram и collector: дедупликация, `chat_id` из multipart при ошибке, переполнение очереди и отчёт о потерях, 401, отсутствие токена в батчах. Адаптер проверяется на настоящем `go-telegram/bot`: long polling, именованный хендлер, необработанный апдейт, паника.
+
+## Версии
+
+Версия SDK — `botsight.Version`, изменения — в [CHANGELOG.md](https://github.com/Artem-Kornilov-pro/Botsight/blob/main/CHANGELOG.md).
+
+## Лицензия
+
+[PolyForm Noncommercial 1.0.0](https://github.com/Artem-Kornilov-pro/Botsight/blob/main/LICENSE). Для коммерческого использования нужно отдельное соглашение с автором.

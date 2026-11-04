@@ -4,9 +4,13 @@ Python SDK [Botsight](https://github.com/Artem-Kornilov-pro/Botsight) — ана
 
 ## Установка и подключение
 
+Пакет пока не опубликован в PyPI, его ставят из репозитория по тегу версии:
+
 ```bash
-pip install botsight
+pip install "botsight @ git+https://github.com/Artem-Kornilov-pro/Botsight.git@v0.1.0#subdirectory=sdk/python"
 ```
+
+Hosted-версии Botsight пока нет. При самостоятельном развёртывании ([быстрый старт](https://github.com/Artem-Kornilov-pro/Botsight#быстрый-старт)) передайте адрес своего collector: `setup(..., endpoint="http://localhost:8081")`.
 
 ```python
 import os
@@ -51,7 +55,7 @@ async def pay(cb: CallbackQuery, botsight: Botsight):
 | Параметр | По умолчанию | Описание |
 |---|---|---|
 | `api_key` | — | ключ проекта из дашборда |
-| `endpoint` | `https://ingest.botsight.ru` | адрес приёма (для self-hosted) |
+| `endpoint` | `https://ingest.botsight.ru` | адрес приёма; при самостоятельном развёртывании — адрес вашего collector |
 | `capture_text` | `False` | отправлять тексты сообщений (до 4096 символов) |
 | `skip_text_in_states` | пусто | состояния, в которых текст не отправляется даже при `capture_text=True`. Можно передать строки `"Form:name"`, объекты `State` или целый `StatesGroup` |
 | `redact` | `None` | функция `(text) -> text` для своего маскирования. Вызывается в фоновом потоке. Если она упала, текст не отправляется |
@@ -118,6 +122,10 @@ pytest                  # тесты
 pytest -m benchmark     # бенчмарк накладных расходов
 ruff check . && ruff format --check . && mypy
 ```
+
+## Версии
+
+Версия SDK — `botsight.__version__`, изменения — в [CHANGELOG.md](https://github.com/Artem-Kornilov-pro/Botsight/blob/main/CHANGELOG.md). SDK 0.1.0 отправляет батчи `schema_version: 1` ([контракт](https://github.com/Artem-Kornilov-pro/Botsight/blob/main/docs/contract/batch_v1.json)).
 
 ## Лицензия
 
