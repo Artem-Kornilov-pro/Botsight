@@ -117,6 +117,10 @@ type Collector struct {
 	MaxInflight      int           // INGEST_MAX_INFLIGHT: concurrent batches per instance, default 512
 	KeyCacheTTL      time.Duration // KEY_CACHE_TTL, default 60s
 	LogLevel         string        // LOG_LEVEL
+	// COLLECTOR_TRANSACTIONS: a batch reaches Kafka whole or not at all, default true
+	Transactions bool
+	TxnWorkers   int           // COLLECTOR_TXN_WORKERS: parallel transactions, default 4
+	TxnLinger    time.Duration // COLLECTOR_TXN_LINGER: a group waits this long for more batches, default 2ms
 }
 
 func LoadCollector() (Collector, error) {
@@ -134,6 +138,9 @@ func LoadCollector() (Collector, error) {
 	c.Burst = p.float("INGEST_BURST", 20000)
 	c.MaxInflight = p.int("INGEST_MAX_INFLIGHT", 512)
 	c.KeyCacheTTL = p.duration("KEY_CACHE_TTL", 60*time.Second)
+	c.Transactions = p.bool("COLLECTOR_TRANSACTIONS", true)
+	c.TxnWorkers = p.int("COLLECTOR_TXN_WORKERS", 4)
+	c.TxnLinger = p.duration("COLLECTOR_TXN_LINGER", 2*time.Millisecond)
 	if p.err != nil {
 		return c, p.err
 	}

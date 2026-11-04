@@ -241,12 +241,25 @@ func consume(t *testing.T, topic string, projectID int32) []*kgo.Record {
 	})
 	pid := []byte(strconv.Itoa(int(projectID)))
 	var out []*kgo.Record
+	last := map[int32]int64{}
 	for len(remaining) > 0 {
-		fetches := cl.PollFetches(ctx)
+		pollCtx, cancelPoll := context.WithTimeout(ctx, time.Second)
+		fetches := cl.PollFetches(pollCtx)
+		cancelPoll()
 		if ctx.Err() != nil {
 			t.Fatalf("reading %s: %d partitions not read to the end", topic, len(remaining))
 		}
+		if fetches.NumRecords() == 0 {
+			// caught up: a transaction's commit marker may hold the last offset, and
+			// markers are never handed to consumers
+			for p, end := range remaining {
+				if seen, ok := last[p]; ok && seen+2 >= end {
+					delete(remaining, p)
+				}
+			}
+		}
 		fetches.EachRecord(func(r *kgo.Record) {
+			last[r.Partition] = r.Offset
 			if end, ok := remaining[r.Partition]; ok && r.Offset+1 >= end {
 				delete(remaining, r.Partition)
 			}

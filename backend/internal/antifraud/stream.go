@@ -73,7 +73,8 @@ func NewStream(cfg StreamConfig, ch driver.Conn, log *slog.Logger, m *Metrics) (
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ConsumerGroup(cfg.Group),
 		kgo.ConsumeTopics(cfg.Topic),
-		kgo.DisableAutoCommit(), // offsets are never committed: state comes from the replay window
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()), // only committed batches of the collector
+		kgo.DisableAutoCommit(),                      // offsets are never committed: state comes from the replay window
 		kgo.BlockRebalanceOnPoll(),
 		kgo.FetchMaxBytes(64<<20),
 		kgo.OnPartitionsAssigned(s.assigned),

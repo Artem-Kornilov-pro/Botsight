@@ -104,6 +104,8 @@ func New(cfg Config, ch driver.Conn, rdb redis.UniversalClient, sinks []Sink, lo
 		kgo.DisableAutoCommit(),
 		kgo.BlockRebalanceOnPoll(),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		// only committed batches: a batch the collector aborted is never inserted (#32)
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
 		kgo.FetchMaxBytes(64 << 20),
 		kgo.OnPartitionsAssigned(w.assigned),
 		kgo.OnPartitionsRevoked(w.revoked),

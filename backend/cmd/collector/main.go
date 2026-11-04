@@ -76,10 +76,26 @@ func run() error {
 	keys := ingest.NewKeyCache(st, cfg.KeyCacheTTL, 10*time.Second, 100_000, metrics)
 	go keys.ListenRevocations(ctx, rdb, logger)
 
+	// Records of a batch go to Kafka in a transaction: all of them or none (#32). The plain
+	// client above stays for creating topics and for readiness.
+	var batches ingest.Producer = producer
+	if cfg.Transactions {
+		host, _ := os.Hostname()
+		txn, err := ingest.NewTxnProducer(ingest.TxnConfig{
+			Brokers: kafka.Brokers(cfg.KafkaBrokers), IDPrefix: host,
+			Workers: cfg.TxnWorkers, Linger: cfg.TxnLinger, Logger: logger,
+		})
+		if err != nil {
+			return err
+		}
+		defer txn.Close()
+		batches = txn
+	}
+
 	collector := ingest.New(ingest.Deps{
 		Keys:     keys,
 		Gate:     ingest.NewGate(rdb, cfg.RatePerSecond, cfg.Burst),
-		Producer: producer,
+		Producer: batches,
 		Bots:     st,
 		Logger:   logger,
 		Metrics:  metrics,
