@@ -43,6 +43,8 @@ type options struct {
 	texts       bool
 	fraud       float64
 	journal     string
+	retryFor    time.Duration
+	keepAlive   bool
 }
 
 func main() {
@@ -60,6 +62,8 @@ func main() {
 	flag.BoolVar(&o.texts, "texts", false, "enable capture_text and send message texts on several topics (for the AI module)")
 	flag.Float64Var(&o.fraud, "fraud", 0, "share of users that are bot farms: scripted promo_farm accounts and a referral farm (for antifraud)")
 	flag.StringVar(&o.journal, "journal", "", "file to write accepted event_ids to, for reconciliation")
+	flag.BoolVar(&o.keepAlive, "keepalive", true, "reuse connections; false opens one per request (chaos tests pick requests by connection)")
+	flag.DurationVar(&o.retryFor, "retry-for", 0, "retry a batch with backoff for this long, like the SDK (chaos tests); 0: 5 quick attempts")
 	flag.Parse()
 
 	if err := run(o); err != nil {
@@ -99,9 +103,10 @@ func run(o options) error {
 		defer journal.Flush()
 	}
 
-	st := &stats{statuses: map[int]int64{}}
+	st := &stats{statuses: map[int]int64{}, retryFor: o.retryFor}
 	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{
 		MaxIdleConns: o.concurrency * 2, MaxIdleConnsPerHost: o.concurrency * 2, IdleConnTimeout: 90 * time.Second,
+		DisableKeepAlives: !o.keepAlive,
 	}}
 	runCtx, cancel := context.WithTimeout(ctx, o.duration)
 	defer cancel()
@@ -137,10 +142,10 @@ func run(o options) error {
 					}
 					journalMu.Unlock()
 				}
-				record(st.send(ctx, client, o.collector, p, body))
+				record(st.send(ctx, client, o.collector, p, body, false))
 				if o.duplicates > 0 && mrand.Float64() < o.duplicates {
 					st.duplicatesSent.Add(1)
-					record(st.send(ctx, client, o.collector, p, body))
+					record(st.send(ctx, client, o.collector, p, body, true))
 				}
 				if interval > 0 {
 					next = next.Add(interval)
@@ -410,21 +415,52 @@ type stats struct {
 	duplicates     atomic.Int64
 	duplicatesSent atomic.Int64
 	errors         atomic.Int64
+	gaveUp         atomic.Int64 // batches dropped after retries: their fate is unknown
+	recovered      atomic.Int64 // repeats answered "duplicate": the first answer was lost
+	retryFor       time.Duration
 }
 
-// send posts a batch, retrying 409/429/503 like the SDK. It reports whether the
-// batch was accepted for the first time.
-func (s *stats) send(ctx context.Context, c *http.Client, collector string, p project, body []byte) bool {
-	for attempt := 0; attempt < 5 && ctx.Err() == nil; attempt++ {
+// send posts a batch and reports whether its events were accepted, for the journal.
+// Like the SDK it repeats the same body, so the same batch_id, on network errors, 409,
+// 429 and 503. A repeat answered "duplicate" means an earlier attempt was accepted and
+// only its answer was lost (collector killed, connection reset): its events are in
+// ClickHouse and count as accepted. An intended resend (-duplicates) never counts: its
+// batch was journaled by the first send, at whatever attempt it answers "duplicate".
+func (s *stats) send(ctx context.Context, c *http.Client, collector string, p project, body []byte, resend bool) bool {
+	started := time.Now()
+	pause := 100 * time.Millisecond
+	retry := func(attempt int) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		if s.retryFor <= 0 {
+			if attempt >= 4 {
+				return false
+			}
+			time.Sleep(time.Duration(100*(attempt+1)) * time.Millisecond)
+			return true
+		}
+		if time.Since(started) > s.retryFor {
+			return false
+		}
+		time.Sleep(pause)
+		pause = min(pause*2, 2*time.Second)
+		return true
+	}
+	for attempt := 0; ; attempt++ {
 		req, _ := http.NewRequestWithContext(ctx, "POST", collector+"/v1/batch", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Content-Encoding", "gzip")
 		req.Header.Set("Authorization", "Bearer "+p.key)
-		started := time.Now()
+		sent := time.Now()
 		resp, err := c.Do(req)
 		if err != nil {
 			if ctx.Err() == nil {
 				s.errors.Add(1)
+			}
+			if !retry(attempt) {
+				s.gaveUp.Add(1)
+				return false
 			}
 			continue
 		}
@@ -436,23 +472,28 @@ func (s *stats) send(ctx context.Context, c *http.Client, collector string, p pr
 		resp.Body.Close()
 		s.mu.Lock()
 		s.statuses[resp.StatusCode]++
-		s.latencies = append(s.latencies, time.Since(started))
+		s.latencies = append(s.latencies, time.Since(sent))
 		s.mu.Unlock()
 		switch resp.StatusCode {
 		case http.StatusAccepted:
-			if out.Duplicate {
+			if out.Duplicate && resend {
 				s.duplicates.Add(1)
 				return false
+			}
+			if out.Duplicate {
+				s.recovered.Add(1) // the first answer was lost, the batch was in
 			}
 			s.accepted.Add(out.Accepted)
 			return true
 		case http.StatusConflict, http.StatusTooManyRequests, http.StatusServiceUnavailable:
-			time.Sleep(time.Duration(100*(attempt+1)) * time.Millisecond)
+			if !retry(attempt) {
+				s.gaveUp.Add(1)
+				return false
+			}
 		default:
 			return false
 		}
 	}
-	return false
 }
 
 func (s *stats) report(elapsed time.Duration, projects []project) {
@@ -473,6 +514,7 @@ func (s *stats) report(elapsed time.Duration, projects []project) {
 		elapsed.Round(time.Millisecond), requests, float64(requests)/elapsed.Seconds(), s.statuses, s.errors.Load())
 	fmt.Printf("accepted events %d (%.0f/s); duplicate batches sent %d, answered as duplicates %d\n",
 		s.accepted.Load(), float64(s.accepted.Load())/elapsed.Seconds(), s.duplicatesSent.Load(), s.duplicates.Load())
+	fmt.Printf("batches given up %d, accepted with a lost answer %d\n", s.gaveUp.Load(), s.recovered.Load())
 	fmt.Printf("latency p50 %s, p95 %s, p99 %s, max %s\n",
 		pct(.50).Round(time.Microsecond*100), pct(.95).Round(time.Microsecond*100),
 		pct(.99).Round(time.Microsecond*100), pct(1).Round(time.Microsecond*100))
