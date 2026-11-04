@@ -1,0 +1,31 @@
+name: sdk-go
+
+on:
+  push:
+    branches: [main]
+    paths: ["sdk/go/**", ".github/workflows/sdk-go.yml"]
+  pull_request:
+    paths: ["sdk/go/**", ".github/workflows/sdk-go.yml"]
+
+defaults:
+  run:
+    working-directory: sdk/go
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.24", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: sdk/go/go.sum
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race ./...

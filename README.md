@@ -9,7 +9,7 @@ setup(dp, bot, api_key=os.environ["BOTSIGHT_KEY"])
 await dp.start_polling(bot)
 ```
 
-SDK работает внутри процесса бота и отправляет на сервер только события. Токен бота не покидает инфраструктуру владельца, тексты сообщений по умолчанию не собираются. Если Botsight недоступен, бот продолжает работать как обычно. Для ботов без SDK есть режим прокси Bot API: достаточно поменять адрес Bot API.
+SDK работает внутри процесса бота и отправляет на сервер только события. Токен бота не покидает инфраструктуру владельца, тексты сообщений по умолчанию не собираются. Если Botsight недоступен, бот продолжает работать как обычно. Для ботов на Go есть Go SDK (одна опция HTTP-клиента и middleware для `go-telegram/bot`), для ботов на других языках — режим прокси Bot API: достаточно поменять адрес Bot API.
 
 Подробное проектирование — в [Botsight.md](Botsight.md).
 
@@ -32,6 +32,7 @@ flowchart LR
 | Часть | Что делает | Код |
 |---|---|---|
 | SDK | middleware aiogram 3: входящие апдейты, шаги FSM, вызовы Bot API, блокировки; очередь в памяти, батчи, ретраи | [sdk/python](sdk/python) |
+| Go SDK | `http.RoundTripper` для любого Go-бота и адаптер `go-telegram/bot`: вызовы Bot API, апдейты, время и паники хендлеров; без зависимостей в ядре | [sdk/go](sdk/go) |
 | `collector` | приём батчей: ключи с кэшем и singleflight, дедупликация и лимит одним Lua-скриптом в Redis, запись в Kafka с `acks=all` | [backend/internal/ingest](backend/internal/ingest) |
 | `ch-writer` | Kafka → ClickHouse пачками без потерь и дублей при падении между вставкой и коммитом смещения, DLQ | [backend/internal/chwriter](backend/internal/chwriter) |
 | `api` | аккаунты, проекты, ключи (PostgreSQL); аналитика из ClickHouse — обзор, воронки (`windowFunnel`), источники и стоимость пользователя, когорты (`retention`), ошибки, граф FSM, таймлайн; живая лента событий по SSE из Kafka; рассылки по сегментам | [backend/internal/httpapi](backend/internal/httpapi), [backend/internal/query](backend/internal/query), [OpenAPI](backend/api/openapi.yaml) |
@@ -67,7 +68,8 @@ cd backend && go run ./cmd/loadgen -projects 3 -users 500 -rate 3000 -duration 3
 
 ```bash
 cd backend && go test -race ./...     # Go; интеграционные тесты используют Docker
-cd sdk/python && pytest               # SDK
+cd sdk/python && pytest               # Python SDK
+cd sdk/go && go test -race ./...      # Go SDK
 cd ai && pytest                       # ai-worker
 cd web && npm test                    # дашборд; npm run e2e — Playwright против стека
 ```
