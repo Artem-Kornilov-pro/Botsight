@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -378,10 +379,16 @@ func TestRateLimitPerProject(t *testing.T) {
 func TestAuthentication(t *testing.T) {
 	h := newHarness(t, options{})
 	body, _ := json.Marshal(sdkBatch(sdkEvent(nil)))
+	// a key that differs in the last character: replacing it with a fixed "x" left the key
+	// unchanged whenever it already ended in "x", about once in 60 runs
+	last := "x"
+	if strings.HasSuffix(h.key, "x") {
+		last = "y"
+	}
 	for name, auth := range map[string]string{
 		"missing":   "",
 		"malformed": "Bearer nope",
-		"wrong":     "Bearer " + h.key[:len(h.key)-1] + "x",
+		"wrong":     "Bearer " + h.key[:len(h.key)-1] + last,
 		"unknown":   "Bearer bs_live_zzzzzzzz_" + h.key[len(h.key)-40:],
 	} {
 		if r := h.post(gz(body), map[string]string{"Authorization": auth}); r.status != http.StatusUnauthorized {

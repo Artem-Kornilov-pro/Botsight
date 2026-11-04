@@ -50,7 +50,16 @@ const sections: Array<{ title?: string; links: Array<{ to: string; label: string
       { to: "user", label: "Пользователь" },
     ],
   },
-  { title: "Бот", links: [{ to: "connect", label: "Подключение" }] },
+  {
+    title: "Бот",
+    links: [
+      { to: "broadcasts", label: "Рассылки" },
+      { to: "antifraud", label: "Антифрод" },
+      { to: "ai", label: "AI: темы и вопросы" },
+      { to: "connect", label: "Подключение" },
+      { to: "settings", label: "Настройки" },
+    ],
+  },
 ];
 
 export function ProjectLayout() {
