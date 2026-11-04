@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -82,7 +83,7 @@ func BenchmarkHotPath(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		records, accepted, _, _ := c.buildRecords(project, batch)
+		records, accepted, _, _ := c.buildRecords(context.Background(), project, batch)
 		if accepted != 500 || len(records) != 501 {
 			b.Fatalf("accepted %d, records %d", accepted, len(records))
 		}

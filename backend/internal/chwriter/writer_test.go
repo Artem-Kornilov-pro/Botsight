@@ -17,11 +17,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/chwriter"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/event"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/kafka"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/testenv"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/tracing"
 )
 
 var (
@@ -368,5 +373,85 @@ func TestGracefulStopFlushesBuffer(t *testing.T) {
 	_ = stopAgain()
 	if rows := f.count(countEvents); rows != 100 {
 		t.Fatalf("rows %d after restart", rows)
+	}
+}
+
+// TestTraceContinuesToClickHouse checks Botsight.md, 17.3: records of a sampled batch
+// carry the collector's traceparent, and ch-writer continues that trace with a span per
+// batch and chunk that ends once the rows are inserted and the offset committed.
+func TestTraceContinuesToClickHouse(t *testing.T) {
+	f := newFixture(t, 3)
+	rec := tracetest.NewSpanRecorder()
+	w, _ := f.writer(chwriter.Config{BatchRows: 100, Tracer: sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))}, nil)
+	stop := run(w)
+	defer stop()
+
+	collector := sdktrace.NewTracerProvider() // stands for the collector's provider
+	now := time.Now().UnixMilli()
+	batch := func(ctx context.Context, from, n int) []*kgo.Record {
+		headers := tracing.Inject(ctx, []kgo.RecordHeader{{Key: "project_id", Value: []byte("1")}})
+		var recs []*kgo.Record
+		for i := from; i < from+n; i++ {
+			r := f.record(kafka.TopicEvents, uint64(i%20+1), event.Record{ProjectID: f.projectID, BotID: 77,
+				EventID: uuidFor(f.projectID, i), TS: now, ReceivedAt: now, Type: "update", Name: "message", UserID: uint64(i%20 + 1)})
+			r.Headers = headers
+			recs = append(recs, r)
+		}
+		return recs
+	}
+	ctxA, spanA := collector.Tracer("c").Start(context.Background(), "POST /v1/batch")
+	ctxB, spanB := collector.Tracer("c").Start(context.Background(), "POST /v1/batch")
+	unsampled, spanC := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample())).Tracer("c").Start(context.Background(), "x")
+	recs := append(append(batch(ctxA, 0, 60), batch(ctxB, 60, 30)...), batch(unsampled, 90, 40)...)
+	spanA.End()
+	spanB.End()
+	spanC.End()
+	if err := f.producer.ProduceSync(context.Background(), recs...).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	f.waitCount(countEvents, 130)
+
+	want := map[trace.SpanID]int{spanA.SpanContext().SpanID(): 60, spanB.SpanContext().SpanID(): 30}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		got := map[trace.SpanID]int{}
+		bad := ""
+		for _, s := range rec.Ended() {
+			parent := s.Parent()
+			if s.Name() != "deliver events" || s.SpanKind() != trace.SpanKindConsumer || !parent.IsRemote() || s.Status().Code != codes.Unset {
+				bad = fmt.Sprintf("unexpected span %s kind %v status %v", s.Name(), s.SpanKind(), s.Status())
+			}
+			if _, ok := want[parent.SpanID()]; !ok || s.SpanContext().TraceID() != parent.TraceID() {
+				bad = fmt.Sprintf("span outside the sampled batches: parent %v", parent)
+			}
+			var events []string
+			for _, e := range s.Events() {
+				events = append(events, e.Name)
+			}
+			if strings.Join(events, ",") != "chunk taken,inserted into ClickHouse,offset committed" {
+				bad = fmt.Sprintf("events %v", events)
+			}
+			if s.StartTime().After(s.Events()[0].Time) {
+				bad = "the span must start when the batch was written to Kafka"
+			}
+			for _, a := range s.Attributes() {
+				if a.Key == "botsight.batch_rows" {
+					got[parent.SpanID()] += int(a.Value.AsInt64())
+				}
+			}
+		}
+		if bad != "" {
+			t.Fatal(bad)
+		}
+		if fmt.Sprint(got) == fmt.Sprint(want) {
+			if spanA.SpanContext().TraceID() == spanB.SpanContext().TraceID() {
+				t.Fatal("two batches in one trace")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rows per traced batch %v, want %v", got, want)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

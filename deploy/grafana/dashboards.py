@@ -71,6 +71,26 @@ def stat(title, expr, unit="short", w=4, h=4, desc="", steps=None, decimals=None
     }
 
 
+JAEGER = {"type": "jaeger", "uid": "jaeger"}
+
+
+def traces(title, service, operation, w=24, h=8, desc=""):
+    """Latest sampled traces from Jaeger; a Trace ID opens the whole trace (Botsight.md, 17.3)."""
+    return {
+        "id": next(_ids),
+        "type": "table",
+        "title": title,
+        "description": desc,
+        "datasource": JAEGER,
+        "gridPos": {"w": w, "h": h},
+        "targets": [{"refId": "A", "datasource": JAEGER, "queryType": "search", "service": service, "operation": operation, "limit": 20}],
+        "fieldConfig": {"defaults": {}, "overrides": [
+            {"matcher": {"id": "byName", "options": "duration"}, "properties": [{"id": "displayName", "value": "Запрос к collector"}]},
+        ]},
+        "options": {"showHeader": True, "sortBy": [{"displayName": "Start time", "desc": True}]},
+    }
+
+
 def row(title):
     return {"id": next(_ids), "type": "row", "title": title, "collapsed": False, "gridPos": {"w": 24, "h": 1}, "panels": []}
 
@@ -145,6 +165,7 @@ pipeline = dashboard("botsight-pipeline", "Botsight — приём и конве
         ('sum by (topic) (increase(botsight_dlq_total[5m]))', "в DLQ {{topic}}"),
     ], "short", desc="ошибки вставки повторяются; DLQ — записи, которые не разобрать"),
     timeseries("Партиции на паузе", [("sum(botsight_ch_paused_partitions)", "на паузе")], "short", desc="backpressure, пока ClickHouse недоступен"),
+    traces("Трейсы батчей", "collector", "POST /v1/batch", desc="доля батчей из OTEL_TRACES_SAMPLER_ARG; длительность — только запрос к collector, Trace ID открывает весь путь до коммита в ch-writer"),
     row("Антифрод, AI, прокси"),
     timeseries("Антифрод: прогоны", [('sum by (result) (increase(botsight_antifraud_runs_total[5m]))', "{{result}}"), ("max(botsight_antifraud_run_seconds)", "длительность, с")], "short", w=8),
     timeseries("AI: вызовы LLM", [('sum by (purpose, result) (increase(botsight_ai_llm_calls_total[5m]))', "{{purpose}} {{result}}")], "short", w=8),

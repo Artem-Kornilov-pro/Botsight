@@ -24,8 +24,10 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/kafka"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/tracing"
 )
 
 type Config struct {
@@ -37,6 +39,9 @@ type Config struct {
 	MaxBufferedRows int
 	RetryMax        time.Duration // cap of the insert retry backoff
 	PlanTTL         time.Duration // how long a chunk plan is kept in Redis
+	// Tracer continues the traces of sampled batches up to the commit (Botsight.md,
+	// 17.3); nil or a no-op provider turns tracing off.
+	Tracer trace.TracerProvider
 	// AfterInsert is a failure-injection hook for tests (Botsight.md, 18.3): an error
 	// stops the writer as if the process died between the insert and the commit.
 	AfterInsert func(topic string, partition int32, token string) error
@@ -79,6 +84,7 @@ type Writer struct {
 	sinks   map[string]Sink
 	log     *slog.Logger
 	metrics *Metrics
+	tracer  trace.Tracer // nil when tracing is off
 
 	crash context.CancelCauseFunc // set by Run; used by the AfterInsert crash simulation
 
@@ -91,6 +97,9 @@ func New(cfg Config, ch driver.Conn, rdb redis.UniversalClient, sinks []Sink, lo
 	w := &Writer{
 		cfg: cfg, ch: ch, rdb: rdb, log: log, metrics: m,
 		sinks: map[string]Sink{}, workers: map[topicPartition]*partitionWorker{},
+	}
+	if tracing.Enabled(cfg.Tracer) {
+		w.tracer = cfg.Tracer.Tracer("github.com/Artem-Kornilov-pro/Botsight/backend/internal/chwriter")
 	}
 	topics := make([]string, 0, len(sinks))
 	for _, s := range sinks {

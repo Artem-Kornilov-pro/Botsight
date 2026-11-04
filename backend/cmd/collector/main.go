@@ -21,6 +21,7 @@ import (
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/ingest"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/kafka"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/store"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/tracing"
 )
 
 func main() {
@@ -39,11 +40,24 @@ func run() error {
 	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
 		return err
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	// trace_id in log lines logged with a context (Botsight.md, 17.3)
+	logger := slog.New(tracing.LogHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
 	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	tracer, shutdownTracing, err := tracing.Setup(ctx, "collector")
+	if err != nil {
+		return err
+	}
+	defer func() { // after the service stopped: spans of the last batches are flushed too
+		tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(tctx); err != nil {
+			logger.Warn("cannot flush traces", "err", err)
+		}
+	}()
 
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -111,6 +125,7 @@ func run() error {
 		},
 		Config:     ingest.Config{MaxInflight: cfg.MaxInflight},
 		Broadcasts: &ingest.Broadcasts{Store: st, Redis: rdb},
+		Tracer:     tracer,
 	})
 
 	httpServer := &http.Server{

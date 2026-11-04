@@ -1128,6 +1128,61 @@
     },
     {
       "id": 20,
+      "type": "table",
+      "title": "Трейсы батчей",
+      "description": "доля батчей из OTEL_TRACES_SAMPLER_ARG; длительность — только запрос к collector, Trace ID открывает весь путь до коммита в ch-writer",
+      "datasource": {
+        "type": "jaeger",
+        "uid": "jaeger"
+      },
+      "gridPos": {
+        "w": 24,
+        "h": 8,
+        "x": 0,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "jaeger",
+            "uid": "jaeger"
+          },
+          "queryType": "search",
+          "service": "collector",
+          "operation": "POST /v1/batch",
+          "limit": 20
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Запрос к collector"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Start time",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "id": 21,
       "type": "row",
       "title": "Антифрод, AI, прокси",
       "collapsed": false,
@@ -1135,12 +1190,12 @@
         "w": 24,
         "h": 1,
         "x": 0,
-        "y": 54
+        "y": 62
       },
       "panels": []
     },
     {
-      "id": 21,
+      "id": 22,
       "type": "timeseries",
       "title": "Антифрод: прогоны",
       "description": "",
@@ -1152,7 +1207,7 @@
         "w": 8,
         "h": 8,
         "x": 0,
-        "y": 55
+        "y": 63
       },
       "targets": [
         {
@@ -1207,7 +1262,7 @@
       }
     },
     {
-      "id": 22,
+      "id": 23,
       "type": "timeseries",
       "title": "AI: вызовы LLM",
       "description": "",
@@ -1219,7 +1274,7 @@
         "w": 8,
         "h": 8,
         "x": 8,
-        "y": 55
+        "y": 63
       },
       "targets": [
         {
@@ -1265,7 +1320,7 @@
       }
     },
     {
-      "id": 23,
+      "id": 24,
       "type": "timeseries",
       "title": "Прокси Bot API",
       "description": "",
@@ -1277,7 +1332,7 @@
         "w": 8,
         "h": 8,
         "x": 16,
-        "y": 55
+        "y": 63
       },
       "targets": [
         {
