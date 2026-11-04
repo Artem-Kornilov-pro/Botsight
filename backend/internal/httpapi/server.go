@@ -1,5 +1,6 @@
-// Package httpapi is the REST API of the dashboard control plane (Botsight.md, 13.3):
-// accounts and sign-in, projects, members, API keys, saved funnels and ad spend.
+// Package httpapi is the REST API of the dashboard (Botsight.md, 13.3): accounts and
+// sign-in, projects, members, API keys, saved funnels, ad spend and the analytics of
+// the events in ClickHouse.
 package httpapi
 
 import (
@@ -16,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/mail"
+	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/query"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/ratelimit"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/session"
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/store"
@@ -74,15 +76,22 @@ type Deps struct {
 
 type Server struct {
 	Deps
-	ready atomic.Bool
-	jobs  sync.WaitGroup
+	queries *query.Runner // analytics; nil without ClickHouse
+	ready   atomic.Bool
+	jobs    sync.WaitGroup
 }
+
+// queryCacheTTL: dashboard answers are cached for a minute (Botsight.md, 13.3).
+const queryCacheTTL = time.Minute
 
 func New(d Deps) *Server {
 	if d.HTTPClient == nil {
 		d.HTTPClient = &http.Client{Timeout: 60 * time.Second}
 	}
 	s := &Server{Deps: d}
+	if d.ClickHouse != nil {
+		s.queries = &query.Runner{Conn: d.ClickHouse, Cache: d.Redis, TTL: queryCacheTTL}
+	}
 	s.ready.Store(true)
 	return s
 }
@@ -164,6 +173,14 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/keys", s.listKeys)
 				r.With(owner).Post("/keys", s.createKey)
 				r.With(owner).Delete("/keys/{keyID}", s.revokeKey)
+
+				r.Get("/overview", s.overview)
+				r.Get("/fsm-graph", s.fsmGraph)
+				r.Get("/sources", s.sources)
+				r.Get("/retention", s.retention)
+				r.Get("/errors", s.errorsReport)
+				r.Get("/users/{userID}/timeline", s.timeline)
+				r.Post("/funnels/query", s.queryFunnel) // reads only: any role
 
 				r.Get("/funnels", s.listFunnels)
 				r.With(editor).Post("/funnels", s.createFunnel)

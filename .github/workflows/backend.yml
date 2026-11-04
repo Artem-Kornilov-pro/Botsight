@@ -96,6 +96,21 @@ jobs:
             sleep 5
           done
           exit 1
+      - name: analytics API answers on the loadgen data
+        run: |
+          account=$(grep -o 'account [^,]*' /tmp/loadgen.txt | cut -d' ' -f2)
+          pid=$(grep -o "IN ([0-9,]*)" /tmp/loadgen.txt | grep -o '[0-9][0-9]*' | head -1)
+          csrf=$(curl -fsS -c /tmp/jar -H 'Content-Type: application/json' \
+            -d "{\"email\":\"$account\",\"password\":\"loadgen-password\"}" localhost:8080/v1/auth/login | jq -r .csrf_token)
+          api="localhost:8080/v1/projects/$pid"
+          curl -fsS -b /tmp/jar "$api/overview" | jq -e '.users > 0 and .updates > 0 and (.days | length) == 30'
+          curl -fsS -b /tmp/jar -H 'Content-Type: application/json' -H "X-CSRF-Token: $csrf" \
+            -d '{"definition":{"steps":[{"kind":"command","value":"start"},{"kind":"state","value":"Form:lab"},{"kind":"state","value":"Form:name"}],"breakdown":"source"}}' \
+            "$api/funnels/query" | jq -e '.steps[0].users > 0 and .steps[1].users > 0 and (.breakdown | length) > 1'
+          curl -fsS -b /tmp/jar "$api/sources?goal=custom:purchase" | jq -e '(.sources | length) > 1'
+          curl -fsS -b /tmp/jar "$api/fsm-graph" | jq -e '(.edges | length) > 0'
+          curl -fsS -b /tmp/jar "$api/errors" | jq -e '.api | length >= 0'
+          curl -fsS -b /tmp/jar "$api/retention?weeks=2" | jq -e '.cohorts[0].users > 0'
       - name: logs
         if: failure()
         run: docker compose -f deploy/docker-compose.yml logs --tail 200
