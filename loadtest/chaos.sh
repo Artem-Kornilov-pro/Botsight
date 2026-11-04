@@ -25,15 +25,37 @@ log() { printf '\n== %s %s\n' "$(date +%T)" "$*"; }
 
 (cd backend && go build -o "$OUT/loadgen" ./cmd/loadgen)
 
+# One account for the whole run: registration is limited to 10 per hour per address
+# (Botsight.md, 19.5), and a run has more scenarios than that over a day of reruns.
+JAR="$OUT/cookies"
+EMAIL="chaos-$(date +%s)-$$@example.com"
+CSRF=$(curl -fsS -c "$JAR" -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"chaos-password\"}" localhost:8080/v1/auth/register | jq -r .csrf_token)
+
+# new_projects NAME: two fresh projects of the scenario; their keys and ids in KEYS, IDS
+new_projects() {
+  local keys=() ids=() r
+  for i in 1 2; do
+    r=$(curl -fsS -b "$JAR" -H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" \
+      -d "{\"name\":\"$1 $i\"}" localhost:8080/v1/projects)
+    keys+=("$(jq -r .api_key.key <<< "$r")")
+    ids+=("$(jq -r .project.id <<< "$r")")
+  done
+  KEYS=$(IFS=,; echo "${keys[*]}")
+  IDS=$(IFS=,; echo "${ids[*]}")
+  echo "$IDS" > "$OUT/$1.ids"
+}
+
 # start_load NAME COLLECTOR_URL: loadgen in the background, its pid in LOAD_PID
 start_load() {
-  "$OUT/loadgen" -collector "$2" -projects 2 -users 300 -rate "$RATE" -duration "$DURATION" \
+  new_projects "$1"
+  "$OUT/loadgen" -collector "$2" -keys "$KEYS" -users 300 -rate "$RATE" -duration "$DURATION" \
     -concurrency 8 -batch 100 -duplicates 0.02 -retry-for 3m -journal "$OUT/$1.journal" ${EXTRA:-} > "$OUT/$1.txt" 2>&1 &
   LOAD_PID=$!
 }
 
 wait_load() {
-  wait "$LOAD_PID" || { cat "$OUT/$1.txt"; return 1; }
+  wait "$LOAD_PID" || { echo "loadgen failed:"; cat "$OUT/$1.txt"; return 1; }
 }
 
 ch() { curl -fsS "$CH" --data-binary "$1"; }
@@ -42,7 +64,7 @@ ch() { curl -fsS "$CH" --data-binary "$1"; }
 reconcile() {
   local name=$1 fault=$2 txt="$OUT/$1.txt"
   local ids expected rows unique gave_up lost_answers statuses seconds
-  ids=$(grep -o 'IN ([0-9,]*)' "$txt")
+  ids="IN ($(cat "$OUT/$name.ids"))"
   expected=$(($(sort -u "$OUT/$name.journal" | wc -l)))
   # the journal itself must not repeat an event: that would be a bug of the generator,
   # not of Botsight, and would hide behind the comparison
