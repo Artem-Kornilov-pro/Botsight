@@ -8,6 +8,7 @@ Go-модуль с сервисами Botsight:
 | `collector` | принимает батчи событий от SDK (`POST /v1/batch`) и пишет их в Kafka | раздел 10 |
 | `chwriter` | переносит события из Kafka в ClickHouse пачками, без потерь и дублей | раздел 11 |
 | `antifraud` | оценивает долю ботоферм по источникам трафика: признаки пользователей из потока, скоринг раз в минуту, алерты | раздел 15 |
+| `botproxy` | режим прокси Bot API для ботов без SDK: пропускает запросы бота к Telegram, превращает апдейты, вызовы методов и вебхуки в события и отправляет их в collector | раздел 20 |
 | `loadgen` | генератор нагрузки в формате SDK со сверкой результата; `-texts` добавляет тексты сообщений для AI-модуля, `-fraud 0.2` — ботофермы для антифрода | раздел 18 |
 
 AI-модуль (`ai-worker`) написан на Python и лежит в [`../ai`](../ai/README.md).
@@ -28,6 +29,7 @@ docker compose -f deploy/docker-compose.yml up --build
 | http://localhost:8081 | collector: `POST /v1/batch` для SDK, `/metrics` |
 | http://localhost:8082 | ch-writer: `/readyz`, `/metrics` |
 | http://localhost:8083 | antifraud: `/readyz`, `/metrics` |
+| http://localhost:8084 | botproxy: Bot API по адресу `/k/<api_key>`, `/readyz`, `/metrics` |
 | http://localhost:8025 | Mailpit: письма подтверждения почты и сброса пароля |
 | http://localhost:8123 | ClickHouse (HTTP), база `botsight`, пользователь и пароль `botsight` |
 | localhost:9094 | Kafka |
@@ -169,6 +171,31 @@ go run ./cmd/loadgen -projects 3 -users 600 -rate 3000 -duration 30s -fraud 0.2
 ```
 
 Через минуту `GET /v1/projects/{id}/antifraud` покажет долю подозрительных по источникам (войдите под аккаунтом, который напечатал `loadgen`).
+
+## Настройки `botproxy`
+
+| Переменная | По умолчанию | Описание |
+|---|---|---|
+| `COLLECTOR_URL` | — | адрес collector, обязательна |
+| `BOTPROXY_ADDR` | `:8084` | адрес сервера; там же `/healthz`, `/readyz`, `/metrics` |
+| `TELEGRAM_API_URL` | `https://api.telegram.org` | Bot API или свой Local Bot API Server |
+| `BOTPROXY_PUBLIC_URL` | пусто | адрес шлюза, как его видит Telegram. Пусто — `setWebhook` проходит без изменений, и апдейты таких ботов идут мимо шлюза |
+| `REDIS_URL` | пусто | адреса вебхуков; без Redis хранятся в памяти одного инстанса |
+| `BOTPROXY_QUEUE` | `100000` | событий в очереди к collector, сверх — отбрасываются и учитываются в `dropped` |
+| `BOTPROXY_FLUSH_INTERVAL` | `1s` | как часто отправлять батчи |
+| `BOTPROXY_UNSAFE_WEBHOOKS` | `false` | разрешить вебхуки по http и на частные адреса — только для локальной разработки |
+
+Подключить бота на aiogram без SDK:
+
+```python
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
+
+session = AiohttpSession(api=TelegramAPIServer.from_base("http://localhost:8084/k/bs_live_..."))
+bot = Bot(token=TOKEN, session=session)
+```
+
+Для вебхуков нужен публичный https-адрес шлюза, например туннель на `:8084`: `BOTPROXY_PUBLIC_URL=https://<туннель> docker compose -f deploy/docker-compose.yml up botproxy`.
 
 ## Миграции
 

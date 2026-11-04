@@ -6,6 +6,7 @@
 #   ClickHouse  http://localhost:8123  (user and password: botsight)
 #   Kafka       localhost:9094
 #   antifraud   http://localhost:8083  (/readyz, /metrics)
+#   botproxy    http://localhost:8084  (Bot API proxy: /k/<api key>/bot<token>/<method>, /metrics)
 #   ai-worker   http://localhost:8090  (/readyz, /metrics; /internal/ask is called by the api)
 #   Qdrant      http://localhost:6333  (message vectors)
 # Data path: SDK -> collector -> Kafka -> ch-writer -> ClickHouse (Botsight.md, 7.3).
@@ -211,6 +212,27 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+
+  # Bot API proxy mode (Botsight.md, 20): a bot without the SDK points its Bot API base
+  # at http://localhost:8084/k/<api key> and its events reach the collector.
+  botproxy:
+    build:
+      context: ../backend
+      args:
+        SERVICE: botproxy
+    environment:
+      COLLECTOR_URL: http://collector:8081
+      REDIS_URL: redis://redis:6379/0
+      TELEGRAM_API_URL: ${TELEGRAM_API_URL:-https://api.telegram.org}
+      BOTPROXY_PUBLIC_URL: ${BOTPROXY_PUBLIC_URL:-} # an https tunnel to :8084 for webhooks
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8084:8084"
+    depends_on:
+      redis:
+        condition: service_healthy
+      collector:
+        condition: service_started
 
   ai-worker:
     build:
