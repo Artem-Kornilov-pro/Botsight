@@ -31,6 +31,8 @@ docker compose -f deploy/docker-compose.yml up --build
 | http://localhost:8083 | antifraud: `/readyz`, `/metrics` |
 | http://localhost:8084 | botproxy: Bot API по адресу `/k/<api_key>`, `/readyz`, `/metrics` |
 | http://localhost:8025 | Mailpit: письма подтверждения почты и сброса пароля |
+| http://localhost:9090 | Prometheus: метрики всех сервисов, SLO-алерты (`deploy/prometheus`) |
+| http://localhost:3000 | Grafana: дашборды «Приём и конвейер», «API и аналитика», «SLO» (анонимный просмотр; admin / botsight) |
 | http://localhost:8123 | ClickHouse (HTTP), база `botsight`, пользователь и пароль `botsight` |
 | localhost:9094 | Kafka |
 | localhost:5432 | PostgreSQL, база `botsight`, пользователь и пароль `botsight` |
@@ -203,6 +205,17 @@ bot = Bot(token=TOKEN, session=session)
 ```
 
 Для вебхуков нужен публичный https-адрес шлюза, например туннель на `:8084`: `BOTPROXY_PUBLIC_URL=https://<туннель> docker compose -f deploy/docker-compose.yml up botproxy`.
+
+## Мониторинг
+
+Дашборды Grafana — код: панели описаны в `deploy/grafana/dashboards.py`, JSON в `deploy/grafana/dashboards/` генерируется им и подключается только на чтение.
+
+```bash
+python3 deploy/grafana/dashboards.py            # после правки панелей
+docker run --rm -v "$PWD/deploy/prometheus:/p" -w /p --entrypoint promtool prom/prometheus:v3.5.0 test rules rules_test.yml
+```
+
+`api` отдаёт `/metrics`: запросы по шаблону маршрута, `botsight_query_duration_seconds{kind}`, `botsight_query_cache_total{kind,result}`, `botsight_live_streams`. ch-writer — свежесть `botsight_ch_freshness_seconds`.
 
 ## Миграции
 

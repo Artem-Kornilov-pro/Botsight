@@ -70,6 +70,27 @@ jobs:
             sleep 2
           done
           exit 1
+      - name: monitoring sees every service, SLO rules and dashboards are loaded
+        run: |
+          for i in $(seq 1 30); do
+            down=$(curl -fsS localhost:9090/api/v1/targets | jq '[.data.activeTargets[] | select(.health != "up")] | length')
+            echo "targets down: $down"
+            [ "$down" = "0" ] && break
+            sleep 2
+          done
+          [ "$down" = "0" ] || { curl -fsS localhost:9090/api/v1/targets | jq '.data.activeTargets[] | {job: .labels.job, health, lastError}'; exit 1; }
+          rules=$(curl -fsS localhost:9090/api/v1/rules | jq '[.data.groups[].rules[]] | length')
+          echo "rules: $rules"; [ "$rules" -ge 15 ]
+          dashboards=$(curl -fsS 'localhost:3000/api/search?tag=botsight' | jq length)
+          echo "dashboards: $dashboards"; [ "$dashboards" = "3" ]
+          # SLO "freshness": after loadgen, p95 from Kafka to ClickHouse is under 10 s
+          for i in $(seq 1 30); do
+            fresh=$(curl -fsS localhost:9090/api/v1/query --data-urlencode 'query=botsight:freshness_p95:5m' | jq -r '.data.result[0].value[1] // empty')
+            echo "freshness p95: ${fresh:-none}"
+            [ -n "$fresh" ] && awk -v f="$fresh" 'BEGIN { exit !(f < 10) }' && exit 0
+            sleep 5
+          done
+          exit 1
       - name: ai-worker builds topics from the message texts
         run: |
           ids=$(grep -o "IN ([0-9,]*)" /tmp/loadgen.txt)

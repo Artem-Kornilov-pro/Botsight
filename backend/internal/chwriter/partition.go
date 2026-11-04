@@ -238,6 +238,7 @@ func (pw *partitionWorker) flush(chunk []*kgo.Record) bool {
 		}
 		w.metrics.InsertDuration.WithLabelValues(pw.sink.Table).Observe(time.Since(started).Seconds())
 		w.metrics.Rows.WithLabelValues(pw.sink.Table).Add(float64(len(rows)))
+		w.metrics.Freshness.WithLabelValues(pw.sink.Table).Observe(time.Since(chunk[0].Timestamp).Seconds())
 	}
 
 	if hook := w.cfg.AfterInsert; hook != nil {

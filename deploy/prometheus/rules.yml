@@ -1,0 +1,85 @@
+# SLO of Botsight.md, 17.2 as recording and alerting rules.
+#
+# Availability of ingestion is 99.9 % of /v1/batch requests without 5xx over 30 days:
+# an error budget of 0.1 %. Alerts burn the budget at two speeds (Google SRE workbook,
+# "multiwindow, multi-burn-rate"): 14.4x in an hour spends 2 % of the month's budget
+# and pages; 6x over six hours spends 5 % and opens a ticket. The short window of each
+# pair keeps the alert from firing long after the problem is gone.
+#
+# Without a single 5xx there is no 5xx series at all, and sum() of nothing is nothing,
+# not zero: "or vector(0)" keeps the ratio at 0 instead of "no data".
+groups:
+  - name: botsight-slo-recording
+    rules:
+      - record: botsight:ingest_error_ratio:rate5m
+        expr: (sum(rate(botsight_ingest_requests_total{code=~"5.."}[5m])) or vector(0)) / clamp_min(sum(rate(botsight_ingest_requests_total[5m])), 1e-9)
+      - record: botsight:ingest_error_ratio:rate30m
+        expr: (sum(rate(botsight_ingest_requests_total{code=~"5.."}[30m])) or vector(0)) / clamp_min(sum(rate(botsight_ingest_requests_total[30m])), 1e-9)
+      - record: botsight:ingest_error_ratio:rate1h
+        expr: (sum(rate(botsight_ingest_requests_total{code=~"5.."}[1h])) or vector(0)) / clamp_min(sum(rate(botsight_ingest_requests_total[1h])), 1e-9)
+      - record: botsight:ingest_error_ratio:rate6h
+        expr: (sum(rate(botsight_ingest_requests_total{code=~"5.."}[6h])) or vector(0)) / clamp_min(sum(rate(botsight_ingest_requests_total[6h])), 1e-9)
+      - record: botsight:ingest_latency_p99:5m
+        expr: histogram_quantile(0.99, sum by (le) (rate(botsight_ingest_duration_seconds_bucket[5m])))
+      - record: botsight:freshness_p95:5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(botsight_ch_freshness_seconds_bucket{table="events"}[5m])))
+      - record: botsight:query_latency_p95:5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(botsight_query_duration_seconds_bucket[5m])))
+
+  - name: botsight-slo-alerts
+    rules:
+      - alert: IngestErrorBudgetFastBurn
+        expr: botsight:ingest_error_ratio:rate1h > (14.4 * 0.001) and botsight:ingest_error_ratio:rate5m > (14.4 * 0.001)
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Приём теряет бюджет ошибок в 14 раз быстрее нормы"
+          description: "Доля 5xx на /v1/batch {{ $value | humanizePercentage }} за час: за час уходит 2 % месячного бюджета."
+      - alert: IngestErrorBudgetSlowBurn
+        expr: botsight:ingest_error_ratio:rate6h > (6 * 0.001) and botsight:ingest_error_ratio:rate30m > (6 * 0.001)
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Приём медленно тратит бюджет ошибок"
+          description: "Доля 5xx на /v1/batch {{ $value | humanizePercentage }} за 6 часов."
+      - alert: IngestLatencyHigh
+        expr: botsight:ingest_latency_p99:5m > 0.05
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "p99 приёма выше 50 мс"
+          description: "p99 /v1/batch {{ $value | humanizeDuration }} (цель < 50 мс)."
+      - alert: DataNotFresh
+        expr: botsight:freshness_p95:5m > 10
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "События попадают в ClickHouse дольше 10 секунд"
+          description: "p95 свежести {{ $value | humanizeDuration }} (цель < 10 с): смотрите лаг потребителя и вставки."
+      - alert: ConsumerLagGrowing
+        expr: sum(botsight_consumer_lag{topic="events.raw"}) > 100000 and deriv(sum(botsight_consumer_lag{topic="events.raw"})[10m:1m]) > 0
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "ch-writer не успевает за потоком"
+          description: "Лаг {{ $value }} записей и растёт."
+      - alert: DeadLetters
+        expr: increase(botsight_dlq_total[15m]) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: "Записи ушли в DLQ"
+          description: "{{ $value }} записей за 15 минут не прошли разбор и лежат в events.dlq."
+      - alert: DashboardSlow
+        expr: botsight:query_latency_p95:5m > 1
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Аналитические запросы дашборда медленнее 1 с"
+          description: "p95 {{ $value | humanizeDuration }} (цель < 1 с)."
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.job }} не отвечает"
+          description: "Prometheus не может снять метрики {{ $labels.instance }} 2 минуты."

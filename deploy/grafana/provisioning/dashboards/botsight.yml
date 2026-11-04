@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: botsight
+    folder: Botsight
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false # dashboards are code: change the JSON in deploy/grafana/dashboards
+    options:
+      path: /var/lib/grafana/dashboards
