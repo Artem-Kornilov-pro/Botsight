@@ -343,3 +343,65 @@ func TestTooHeavy(t *testing.T) {
 		t.Fatalf("want ErrTooHeavy, got %v", err)
 	}
 }
+
+func TestSegment(t *testing.T) {
+	requireEnv(t)
+	pid, base := seed(t, labbot())
+	r := runner()
+	ctx := context.Background()
+	chats := func(s Segment) []int64 {
+		t.Helper()
+		if err := s.Normalize(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := r.SegmentChats(ctx, pid, s, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := r.SegmentSize(ctx, pid, s)
+		if err != nil || n != uint64(len(got)) {
+			t.Fatalf("size %d, chats %v: %v", n, got, err)
+		}
+		return got
+	}
+	vk := "vk"
+	cases := []struct {
+		s    Segment
+		want []int64
+	}{
+		{Segment{}, []int64{101, 103, 104}}, // 102 blocked the bot and never came back
+		{Segment{Source: &vk}, []int64{101}},
+		{Segment{NotReached: &Step{"custom", "lab_generated"}}, []int64{103, 104}},
+		{Segment{Reached: &Step{"state", "Form:lab"}}, []int64{101, 104}},
+		{Segment{ActiveDays: 1}, []int64{}},
+	}
+	for _, c := range cases {
+		if got := chats(c.s); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%+v: %v, want %v", c.s, got, c.want)
+		}
+	}
+
+	// quiet users: one wrote 2 days ago, another 40 minutes ago; 102 came back after blocking
+	ago := func(d time.Duration) time.Duration { return time.Since(base) - d }
+	more := []ev{
+		{at: ago(48 * time.Hour), typ: "update", name: "message", user: 201, chat: 201, chatType: "private", handled: 1},
+		{at: ago(40 * time.Minute), typ: "update", name: "message", user: 202, chat: 202, chatType: "private", handled: 1},
+		{at: ago(time.Hour), typ: "update", name: "message", user: 203, chat: -5, chatType: "group", handled: 1},
+	}
+	pid2, _ := seed(t, more)
+	got, err := r.SegmentChats(ctx, pid2, Segment{ActiveDays: 7, InactiveDays: 1}, 10)
+	if err != nil || !reflect.DeepEqual(got, []int64{201}) {
+		t.Fatalf("inactive: %v %v", got, err)
+	}
+	got, _ = r.SegmentChats(ctx, pid2, Segment{ActiveDays: 7}, 10)
+	if !reflect.DeepEqual(got, []int64{201, 202}) { // a group is not a recipient
+		t.Fatalf("groups: %v", got)
+	}
+
+	if err := (&Segment{ActiveDays: 400}).Normalize(); err == nil {
+		t.Fatal("400 days accepted")
+	}
+	if err := (&Segment{ActiveDays: 5, InactiveDays: 5}).Normalize(); err == nil {
+		t.Fatal("inactive >= active accepted")
+	}
+}

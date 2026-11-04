@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 from . import events
 from ._log import log_limited, logger
+from .broadcast import Broadcaster
 from .options import Options
 from .transport import Sender
 
@@ -42,6 +43,9 @@ class Botsight:
         max_queue: int = 10_000,
         sample_rate: float = 1.0,
         enabled: bool = True,
+        broadcasts: bool = False,
+        broadcast_rate: float = 25.0,
+        broadcast_poll_interval: float = 15.0,
     ) -> None:
         self.options = Options.build(
             endpoint=endpoint,
@@ -58,6 +62,9 @@ class Botsight:
             max_queue=max_queue,
             sample_rate=sample_rate,
             enabled=enabled,
+            broadcasts=broadcasts,
+            broadcast_rate=broadcast_rate,
+            broadcast_poll_interval=broadcast_poll_interval,
         )
         if self.options.enabled and (not isinstance(api_key, str) or not api_key):
             raise ValueError("botsight: api_key is required (get it in the dashboard)")
@@ -67,6 +74,7 @@ class Botsight:
         self._dropped = 0
         self._active = self.options.enabled
         self._sender = Sender(self)
+        self._broadcaster: Broadcaster | None = None  # set by setup() with broadcasts=True
         self._sample_threshold = int(self.options.sample_rate * _SAMPLE_SPACE)
 
     # --- public API -------------------------------------------------------------------
@@ -111,12 +119,17 @@ class Botsight:
         try:
             self._emit(events.lifecycle_event("bot_started", self.bot_id))
             self._sender.start()
+            if self._broadcaster is not None:
+                self._broadcaster.start()
         except Exception:
             log_limited("start", "botsight: failed to start", exc_info=True)
 
     async def close(self) -> None:
         """Flush the queue (up to 5 s) and stop. Registered on ``dp.shutdown``."""
         try:
+            if self._broadcaster is not None:
+                # first: it reports what it sent and tracks broadcast_received events
+                await self._broadcaster.close()
             if self._active:
                 self._emit(events.lifecycle_event("bot_stopped", self.bot_id))
             await self._sender.close()

@@ -186,6 +186,12 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/live", s.live)
 				r.Post("/funnels/query", s.queryFunnel) // reads only: any role
 
+				r.Post("/broadcasts/preview", s.previewBroadcast) // reads only: any role
+				r.With(editor).Post("/broadcasts", s.createBroadcast)
+				r.Get("/broadcasts", s.listBroadcasts)
+				r.Get("/broadcasts/{broadcastID}", s.getBroadcast)
+				r.With(editor).Post("/broadcasts/{broadcastID}/cancel", s.cancelBroadcast)
+
 				r.Get("/funnels", s.listFunnels)
 				r.With(editor).Post("/funnels", s.createFunnel)
 				r.Get("/funnels/{funnelID}", s.getFunnel)
