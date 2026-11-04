@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"math/rand/v2"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -51,8 +52,15 @@ func randomRecord(r *rand.Rand) Record {
 	return rec
 }
 
-// The encoder must write byte for byte what json.Marshal writes: ch-writer, antifraud and
-// /live decode these records, and a difference would only show in production.
+// sameSpelling hides the one difference between Go versions: json.Marshal writes invalid
+// UTF-8 as the escape \ufffd up to Go 1.26 (the toolchain of backend/Dockerfile and CI)
+// and as the raw character from Go 1.27. Both decode to the same string.
+func sameSpelling(b []byte) []byte {
+	return bytes.ReplaceAll(b, []byte(`\ufffd`), []byte("\ufffd"))
+}
+
+// The encoder must write what json.Marshal writes: ch-writer, antifraud and /live decode
+// these records, and a difference would only show in production.
 func TestAppendJSONMatchesMarshal(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2))
 	for i := range 20_000 {
@@ -65,15 +73,23 @@ func TestAppendJSONMatchesMarshal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(got, want) {
+		if !bytes.Equal(sameSpelling(got), sameSpelling(want)) {
 			t.Fatalf("record %d differs\n got: %s\nwant: %s", i, got, want)
+		}
+		var fromGot, fromWant Record
+		if err := json.Unmarshal(got, &fromGot); err != nil {
+			t.Fatalf("record %d: %v\n%s", i, err, got)
+		}
+		_ = json.Unmarshal(want, &fromWant)
+		if !reflect.DeepEqual(fromGot, fromWant) {
+			t.Fatalf("record %d decodes differently\n got: %+v\nwant: %+v", i, fromGot, fromWant)
 		}
 	}
 	// appends after what the buffer already holds
 	rec := randomRecord(r)
 	want, _ := json.Marshal(rec)
 	got, _ := rec.AppendJSON([]byte("prefix"))
-	if !bytes.Equal(got, append([]byte("prefix"), want...)) {
+	if !bytes.Equal(sameSpelling(got), sameSpelling(append([]byte("prefix"), want...))) {
 		t.Fatal("does not append")
 	}
 	if _, err := (&Record{PropsNum: map[string]float64{"x": math.NaN()}}).AppendJSON(nil); err == nil {

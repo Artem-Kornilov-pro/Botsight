@@ -147,7 +147,7 @@ func appendFloat(b []byte, f float64) ([]byte, error) {
 const hexDigits = "0123456789abcdef"
 
 // appendString quotes s the way encoding/json does by default: ", \ and control
-// characters escaped, <, > and & escaped for HTML, invalid UTF-8 replaced by U+FFFD,
+// characters escaped, <, > and & escaped for HTML, invalid UTF-8 written as \ufffd,
 // U+2028 and U+2029 escaped for JavaScript.
 func appendString(b []byte, s string) []byte {
 	b = append(b, '"')
@@ -183,7 +183,7 @@ func appendString(b []byte, s string) []byte {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if r == utf8.RuneError && size == 1 {
 			b = append(b, s[start:i]...)
-			b = append(b, `�`...)
+			b = append(b, `\ufffd`...) // as Go 1.26 json.Marshal, the toolchain of backend/Dockerfile
 			i += size
 			start = i
 			continue
