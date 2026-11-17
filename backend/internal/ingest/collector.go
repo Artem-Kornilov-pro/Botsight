@@ -256,8 +256,18 @@ func (c *Collector) handleBatch(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		c.metrics.ProduceErrors.Inc()
 		c.log.ErrorContext(ctx, "kafka produce failed", "project_id", project.ID, "err", err)
-		if rerr := c.gate.Release(context.WithoutCancel(r.Context()), project.ID, batch.BatchID); rerr != nil {
-			c.log.Warn("failed to release batch key", "err", rerr)
+		// The batch may still be committed (#41): its "processing" mark stays, so a retry
+		// gets 409 until the outcome is known, and then 202 duplicate or a new attempt.
+		var pending *PendingError
+		switch {
+		case errors.As(err, &pending):
+			c.settleLater(ctx, project, batch.BatchID, accepted, pending.Outcome)
+		case errors.Is(err, ErrOutcomeUnknown):
+			c.log.ErrorContext(ctx, "batch left in progress: its outcome in Kafka is unknown", "project_id", project.ID)
+		default:
+			if rerr := c.gate.Release(context.WithoutCancel(ctx), project.ID, batch.BatchID); rerr != nil {
+				c.log.Warn("failed to release batch key", "err", rerr)
+			}
 		}
 		w.Header().Set("Retry-After", "2")
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "event bus unavailable, retry")
@@ -343,6 +353,41 @@ func (c *Collector) buildRecords(ctx context.Context, project Project, batch *ev
 // arenaPerEvent is the buffer reserved per event: a typical encoded event with its key
 // is 300-450 bytes; a bigger batch grows the buffer once or twice.
 const arenaPerEvent = 448
+
+// settleTimeout bounds waiting for a pending outcome; the producer resolves within 90 s.
+const settleTimeout = 2 * time.Minute
+
+// settleLater finishes the gate of a batch whose transaction outcome arrives later:
+// committed — done, so retries get 202 duplicate; not committed — released, so the next
+// retry writes it; unknown — left as is, the processing mark expires.
+func (c *Collector) settleLater(ctx context.Context, project Project, batchID string, accepted int, outcome <-chan error) {
+	ctx = context.WithoutCancel(ctx)
+	c.jobs.Add(1)
+	go func() {
+		defer c.jobs.Done()
+		var err error
+		select {
+		case err = <-outcome:
+		case <-time.After(settleTimeout):
+			err = ErrOutcomeUnknown
+		}
+		gctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		switch {
+		case err == nil:
+			c.log.WarnContext(ctx, "batch committed after its request gave up", "project_id", project.ID)
+			if derr := c.gate.Done(gctx, project.ID, batchID, accepted); derr != nil {
+				c.log.Warn("failed to mark batch done", "err", derr)
+			}
+		case errors.Is(err, ErrOutcomeUnknown):
+			c.log.ErrorContext(ctx, "batch left in progress: its outcome in Kafka is unknown", "project_id", project.ID)
+		default:
+			if rerr := c.gate.Release(gctx, project.ID, batchID); rerr != nil {
+				c.log.Warn("failed to release batch key", "err", rerr)
+			}
+		}
+	}()
+}
 
 func endSpan(span trace.Span, err error) {
 	if err != nil {
