@@ -2,12 +2,14 @@ package ingest
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/Artem-Kornilov-pro/Botsight/backend/internal/kafka"
@@ -24,9 +26,13 @@ import (
 // gets the outcome. Several workers, each a producer with its own transactional id, run
 // in parallel.
 //
-// The window left: a commit sent whose outcome is unknown (the coordinator failed exactly
-// then). The request gets 503 and its retry may duplicate the batch; before, any broker
-// failure in the middle of a write did.
+// A commit can also fail without an answer: the broker stops after the coordinator wrote
+// PrepareCommit but before it replied. franz-go then cannot tell whether the transaction
+// is committed, and treating it as failed duplicated whole batches on the SDK retry (the
+// nightly kafka_stop run, #41). Such an outcome is read from Kafka itself: the coordinator
+// ends every transaction with a COMMIT or ABORT marker in each of its partitions, so the
+// worker reads a partition of the group from one of its records until the marker of its
+// producer (resolve). Until then the requests do not know the outcome; see PendingError.
 type TxnProducer struct {
 	reqs    chan *txnReq
 	workers []*txnWorker
@@ -44,8 +50,27 @@ type TxnConfig struct {
 	Linger   time.Duration // how long a group waits for more requests, default 2 ms
 	MaxGroup int           // records in one transaction, default 20 000
 	Timeout  time.Duration // one transaction, default 10 s
-	Logger   *slog.Logger
+	// ResolveTimeout bounds reading the outcome of a commit that got no answer, default
+	// 90 s: less than the gate's processing mark (2 min), which keeps retries out meanwhile.
+	ResolveTimeout time.Duration
+	Logger         *slog.Logger
+
+	// endTxn replaces EndTransaction in tests (a commit that happens but whose answer is lost)
+	endTxn func(ctx context.Context, cl *kgo.Client, try kgo.TransactionEndTry) error
 }
+
+// ErrOutcomeUnknown: the transaction may be committed or not, and reading its marker did
+// not tell within ResolveTimeout. The batch must be neither confirmed nor released.
+var ErrOutcomeUnknown = errors.New("ingest: kafka transaction outcome unknown")
+
+// PendingError is returned when a request stopped waiting (its context ended) while its
+// transaction was still running or being resolved. Outcome delivers the final result:
+// nil (committed), an error wrapping ErrOutcomeUnknown, or another error (not committed).
+type PendingError struct {
+	Outcome <-chan error
+}
+
+func (e *PendingError) Error() string { return "ingest: kafka transaction outcome not known yet" }
 
 type txnReq struct {
 	records []*kgo.Record
@@ -70,6 +95,9 @@ func NewTxnProducer(cfg TxnConfig) (*TxnProducer, error) {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Second
+	}
+	if cfg.ResolveTimeout <= 0 {
+		cfg.ResolveTimeout = 90 * time.Second
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -107,6 +135,7 @@ func (w *txnWorker) connect() error {
 
 // ProduceSync commits the records in a transaction, shared with requests arriving at the
 // same moment. Every record gets the same error: the batch is in Kafka whole or not at all.
+// A *PendingError means the outcome is not known yet (see TxnProducer).
 func (p *TxnProducer) ProduceSync(ctx context.Context, rs ...*kgo.Record) kgo.ProduceResults {
 	req := &txnReq{records: rs, done: make(chan error, 1)}
 	var err error
@@ -115,9 +144,8 @@ func (p *TxnProducer) ProduceSync(ctx context.Context, rs ...*kgo.Record) kgo.Pr
 		select {
 		case err = <-req.done:
 		case <-ctx.Done():
-			// the transaction goes on; its outcome is unknown to this request: answer 503,
-			// the retry is told the batch is done or still in progress by the gate
-			err = ctx.Err()
+			// the transaction goes on and may commit: the caller must not release the batch
+			err = &PendingError{Outcome: req.done}
 		}
 	case <-ctx.Done():
 		err = ctx.Err()
@@ -157,17 +185,17 @@ func (w *txnWorker) loop(reqs <-chan *txnReq, closed <-chan struct{}) {
 			}
 		}
 		linger.Stop()
-		err := w.commit(group)
+		err := w.commit(group, closed)
 		for _, r := range group {
 			r.done <- err
 		}
 	}
 }
 
-// commit runs one transaction. On any failure the transaction is aborted; if even that
-// fails, the client is replaced, which bumps the producer epoch and fences whatever the
-// broker still holds of it.
-func (w *txnWorker) commit(group []*txnReq) error {
+// commit runs one transaction. A failure before the commit aborts it; if even that fails,
+// the client is replaced, which bumps the producer epoch and fences whatever the broker
+// still holds of it. A commit that got no answer is resolved by reading its marker.
+func (w *txnWorker) commit(group []*txnReq, closed <-chan struct{}) error {
 	ctx, cancel := context.WithTimeout(context.Background(), w.cfg.Timeout)
 	defer cancel()
 	if w.cl == nil {
@@ -181,15 +209,17 @@ func (w *txnWorker) commit(group []*txnReq) error {
 	}
 	var mu sync.Mutex
 	var produceErr error
+	var probe *kgo.Record // a written record: its partition gets the transaction's marker
 	for _, r := range group {
 		for _, rec := range r.records {
-			w.cl.Produce(ctx, rec, func(_ *kgo.Record, err error) {
-				if err != nil {
-					mu.Lock()
-					if produceErr == nil {
-						produceErr = err
-					}
-					mu.Unlock()
+			w.cl.Produce(ctx, rec, func(rec *kgo.Record, err error) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case err != nil && produceErr == nil:
+					produceErr = err
+				case err == nil && probe == nil:
+					probe = rec
 				}
 			})
 		}
@@ -205,12 +235,98 @@ func (w *txnWorker) commit(group []*txnReq) error {
 		w.abort(ctx, failed)
 		return failed
 	}
-	if err := w.cl.EndTransaction(ctx, kgo.TryCommit); err != nil {
-		// unknown or failed commit: abort what may be left; the requests get the error
-		w.abort(ctx, err)
-		return err
+	end := w.cfg.endTxn
+	if end == nil {
+		end = func(ctx context.Context, cl *kgo.Client, try kgo.TransactionEndTry) error {
+			return cl.EndTransaction(ctx, try)
+		}
+	}
+	if err := end(ctx, w.cl, kgo.TryCommit); err != nil {
+		if errors.Is(err, kerr.OperationNotAttempted) || probe == nil {
+			// the commit was never sent: the transaction can only be aborted
+			w.abort(ctx, err)
+			return err
+		}
+		// The commit may have reached the coordinator. This client cannot tell, and a
+		// new one fences whatever is still open; the marker in Kafka has the answer.
+		w.reset(err)
+		return w.resolve(probe, err, closed)
 	}
 	return nil
+}
+
+// resolve reads the outcome of a commit that got no answer: the partition of probe from
+// probe on, uncommitted and with control records, up to the marker of probe's producer.
+// The coordinator writes it once the transaction is decided: at once for a commit it had
+// started; for a commit that never reached it, when it aborts the transaction on its
+// timeout (Timeout + 20 s).
+func (w *txnWorker) resolve(probe *kgo.Record, cause error, closed <-chan struct{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cfg.ResolveTimeout)
+	defer cancel()
+	go func() {
+		select {
+		case <-closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	committed, err := TxnCommitted(ctx, w.cfg.Brokers, probe)
+	switch {
+	case err != nil:
+		w.cfg.Logger.Error("kafka transaction outcome unknown", "id", w.id, "err", errors.Join(cause, err))
+		return fmt.Errorf("%w: %w", ErrOutcomeUnknown, errors.Join(cause, err))
+	case committed:
+		w.cfg.Logger.Warn("kafka commit got no answer but is committed", "id", w.id, "err", cause)
+		return nil
+	default:
+		w.cfg.Logger.Warn("kafka commit got no answer and was aborted", "id", w.id, "err", cause)
+		return fmt.Errorf("ingest: kafka transaction aborted: %w", cause)
+	}
+}
+
+// TxnCommitted tells whether the transaction that wrote rec (a record returned by a
+// transactional produce, with its offset and producer id) is committed: it reads rec's
+// partition from rec on, uncommitted and with control records, until the COMMIT or ABORT
+// marker of rec's producer. It waits for the marker until ctx ends.
+func TxnCommitted(ctx context.Context, brokers []string, rec *kgo.Record) (bool, error) {
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			rec.Topic: {rec.Partition: kgo.NewOffset().At(rec.Offset)},
+		}),
+		kgo.FetchIsolationLevel(kgo.ReadUncommitted()),
+		kgo.KeepControlRecords(),
+	)
+	if err != nil {
+		return false, err
+	}
+	defer cl.Close()
+	for {
+		fetches := cl.PollFetches(ctx)
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		var found, commit bool
+		fetches.EachRecord(func(r *kgo.Record) {
+			if found || !r.Attrs.IsControl() || r.ProducerID != rec.ProducerID || r.Offset <= rec.Offset {
+				return
+			}
+			// the key of a control record: version int16, type int16 (0 abort, 1 commit)
+			if len(r.Key) >= 4 {
+				found, commit = true, binary.BigEndian.Uint16(r.Key[2:4]) == 1
+			}
+		})
+		if found {
+			return commit, nil
+		}
+		if fetches.Err() != nil { // the broker is still down: poll again a bit later
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
 }
 
 func (w *txnWorker) abort(ctx context.Context, cause error) {

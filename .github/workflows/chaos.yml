@@ -2,13 +2,14 @@ name: chaos
 
 # Chaos tests of Botsight.md, 18.3: faults under load, then ClickHouse must hold every
 # accepted event exactly once. Long (~10 min), so nightly and on demand, and on pull
-# requests that change the tests, the generator or the stack.
+# requests that change the tests, the generator, the stack or the delivery path itself.
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 3 * * *"
   pull_request:
-    paths: ["loadtest/**", "backend/cmd/loadgen/**", "deploy/docker-compose.yml", ".github/workflows/chaos.yml"]
+    paths: ["loadtest/**", "backend/cmd/loadgen/**", "backend/internal/ingest/**", "backend/internal/chwriter/**",
+            "backend/internal/kafka/**", "deploy/docker-compose.yml", ".github/workflows/chaos.yml"]
 
 jobs:
   chaos:
